@@ -1,0 +1,9 @@
+# Caddy automatically obtains and renews a Let's Encrypt TLS certificate for
+# this domain — no manual cert steps. Requires:
+#   1. school.evide.in DNS A-record pointing at the EC2 Elastic IP
+#   2. ports 80 and 443 open in the EC2 security group
+#
+# Everything under the domain is proxied to the backend's HTTP API on :3000.
+school.evide.in {
+    reverse_proxy backend:3000
+}

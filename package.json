@@ -1,0 +1,23 @@
+{
+  "name": "school-bus-backend",
+  "version": "1.0.0",
+  "description": "GT06 GPS ingestion + API backend for school bus tracking (V1)",
+  "main": "src/server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "test": "node src/gt06/gt06.test.js",
+    "simulate": "node scripts/simulateGt06Device.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "firebase-admin": "^12.3.0",
+    "pg-boss": "^9.0.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  }
+}

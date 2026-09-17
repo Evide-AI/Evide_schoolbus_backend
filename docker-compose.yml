@@ -1,0 +1,30 @@
+services:
+  backend:
+    build: .
+    restart: always           # auto-starts when EC2 boots (for the 6am scheduled start)
+    env_file: .env
+    ports:
+      - "5023:5023"           # GT06 devices connect here over raw TCP (public)
+    expose:
+      - "3000"                # HTTP API — not published directly; Caddy proxies it over HTTPS
+    volumes:
+      # Firebase service-account key, mounted read-only from the host.
+      # Put the file at ./secrets/serviceAccountKey.json on the server.
+      - ./secrets/serviceAccountKey.json:/app/secrets/serviceAccountKey.json:ro
+
+  caddy:
+    image: caddy:2
+    restart: always
+    depends_on:
+      - backend
+    ports:
+      - "80:80"               # needed for Let's Encrypt HTTP challenge
+      - "443:443"             # HTTPS API traffic (school.evide.in)
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data       # persists the issued TLS certificate across restarts
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

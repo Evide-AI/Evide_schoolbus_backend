@@ -1,0 +1,98 @@
+import { supabase } from '../db/supabaseClient.js';
+import { getQueue, JOBS } from '../queue/queue.js';
+import { getDistanceToNextStopInMeters } from '../utils/geoUtils.js';
+
+// Tunable thresholds — expect to adjust these after your first real field
+// test, per the roadmap's open items. These are reasonable starting points,
+// not measured values.
+//
+// Hysteresis pattern borrowed from the existing Evide backend's stop-arrival
+// logic: the "you've left" radius is deliberately larger than the "you've
+// arrived" radius, so GPS jitter right at the boundary doesn't flicker the
+// trip state back and forth.
+const MOVEMENT_SPEED_THRESHOLD_KMH = 5;
+const STATIONARY_SPEED_THRESHOLD_KMH = 1;
+const SUSTAINED_SECONDS_TO_CONFIRM = 60;
+const STATIONARY_SECONDS_TO_END_TRIP = 180;
+const ARRIVAL_RADIUS_METERS = 100;   // must be within this to count as "at school/garage"
+const DEPARTURE_RADIUS_METERS = 150; // must exceed this to count as "left" — always > ARRIVAL_RADIUS_METERS
+
+// Simple in-memory tracking of "how long has this bus been moving/stationary".
+// Fine for a single-process V1 deployment; if you ever run multiple backend
+// instances, move this state into a table (e.g. a few columns on trip_state).
+const movementTimers = new Map(); // bus_id -> { state: 'moving'|'stationary', since: Date }
+
+async function getTripState(busId) {
+  const { data } = await supabase.from('trip_state').select('*').eq('bus_id', busId).maybeSingle();
+  return data || { bus_id: busId, status: 'NOT_STARTED' };
+}
+
+async function setTripState(busId, status, triggeredBy) {
+  const now = new Date().toISOString();
+  const update = { bus_id: busId, status, triggered_by: triggeredBy, updated_at: now };
+  if (status === 'IN_PROGRESS') update.started_at = now;
+  if (status === 'COMPLETED') update.ended_at = now;
+
+  await supabase.from('trip_state').upsert(update, { onConflict: 'bus_id' });
+
+  const queue = await getQueue();
+  await queue.send(JOBS.DISPATCH_NOTIFICATION, {
+    type: status === 'IN_PROGRESS' ? 'BUS_STARTED' : 'BUS_REACHED',
+    busId,
+    triggeredBy,
+  });
+}
+
+async function distanceToBase(busId, lat, lng) {
+  const { data: bus } = await supabase.from('buses').select('school_id').eq('id', busId).maybeSingle();
+  if (!bus) return null;
+  const { data: school } = await supabase
+    .from('schools')
+    .select('latitude, longitude')
+    .eq('id', bus.school_id)
+    .maybeSingle();
+  if (!school || school.latitude == null) return null;
+
+  return getDistanceToNextStopInMeters({ lat, lon: lng }, { lat: school.latitude, lon: school.longitude });
+}
+
+/**
+ * Call this for every GPS ping. Manual driver/conductor taps should call
+ * setTripState(...) directly instead and can ignore this function entirely —
+ * this is only the automatic backstop for when nobody taps the button.
+ */
+export async function evaluateTripState({ busId, latitude, longitude, speedKmh }) {
+  const trip = await getTripState(busId);
+  const distance = await distanceToBase(busId, latitude, longitude);
+  if (distance === null) return; // school has no coordinates set yet — can't evaluate
+
+  const now = new Date();
+  const timer = movementTimers.get(busId);
+  const isAtBase = distance <= ARRIVAL_RADIUS_METERS;
+  const hasLeftBase = distance > DEPARTURE_RADIUS_METERS;
+
+  if (trip.status !== 'IN_PROGRESS' && hasLeftBase && speedKmh >= MOVEMENT_SPEED_THRESHOLD_KMH) {
+    if (!timer || timer.state !== 'moving') {
+      movementTimers.set(busId, { state: 'moving', since: now });
+    } else if ((now - timer.since) / 1000 >= SUSTAINED_SECONDS_TO_CONFIRM) {
+      await setTripState(busId, 'IN_PROGRESS', 'auto');
+      movementTimers.delete(busId);
+    }
+    return;
+  }
+
+  if (trip.status === 'IN_PROGRESS' && isAtBase && speedKmh <= STATIONARY_SPEED_THRESHOLD_KMH) {
+    if (!timer || timer.state !== 'stationary') {
+      movementTimers.set(busId, { state: 'stationary', since: now });
+    } else if ((now - timer.since) / 1000 >= STATIONARY_SECONDS_TO_END_TRIP) {
+      await setTripState(busId, 'COMPLETED', 'auto');
+      movementTimers.delete(busId);
+    }
+    return;
+  }
+
+  // Conditions not met to keep advancing the timer — reset it.
+  if (timer) movementTimers.delete(busId);
+}
+
+export { setTripState, getTripState };
