@@ -96,14 +96,21 @@ async function handleDispatch(job) {
     },
     data: {
       type: job.type || 'GENERAL',
-      ...(job.studentId ? { studentId: job.studentId } : {}),
-      ...(job.busId ? { busId: job.busId } : {}),
+      // Copies of the title/body so a data-only push can still be shown.
+      title: job.title || 'Evide School Bus',
+      body: job.body || '',
+      ...(job.studentId ? { studentId: String(job.studentId) } : {}),
+      ...(job.busId ? { busId: String(job.busId) } : {}),
     },
     android: {
       priority: 'high',
       notification: {
-        channelId: isAlarm ? 'proximity_alarm' : 'general',
+        channelId: isAlarm ? 'proximity_alarm_v2' : 'general',
         sound: isAlarm ? 'alarm' : 'default',
+        // Wakes the screen and keeps the alert up until it's dealt with.
+        priority: 'max',
+        defaultVibrateTimings: false,
+        vibrateTimingsMillis: [0, 500, 250, 500],
       },
     },
     apns: {
