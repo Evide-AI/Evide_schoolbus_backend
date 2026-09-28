@@ -1,0 +1,1111 @@
+diff --git a/.env.example b/.env.example
+index 1369853..c203ebc 100644
+--- a/.env.example
++++ b/.env.example
+@@ -26,3 +26,13 @@ FIREBASE_SERVICE_ACCOUNT=/app/secrets/serviceAccountKey.json
+ # Example: https://dashboard.evide.in,http://localhost:5173
+ # Leave empty to allow all (fine for MVP).
+ ALLOWED_ORIGINS=
++
++# --- "Bus arriving soon" notifications (src/workers/etaWorker.js) ---
++# Alert parents when the bus is this many seconds from their child's stop.
++ETA_ALERT_SECONDS=600
++# Safety net: also alert if the bus is within this distance, whatever the ETA says.
++FALLBACK_RADIUS_METERS=500
++# Before this hour (IST) a trip is the pickup route; from this hour on, drop.
++PICKUP_CUTOFF_HOUR=12
++# Only alert while a trip is running (driver Start or auto-detected). Set false to test without trips.
++REQUIRE_TRIP_IN_PROGRESS=true
+diff --git a/README.md b/README.md
+index 32b05f0..c25724b 100644
+--- a/README.md
++++ b/README.md
+@@ -186,3 +186,23 @@ from `fetchRoadRoute` will surface Mapbox's actual error text to help debug.
+ 
+ To generate both pickup and drop in one call, omit `"type"` from the body.
+ 
++
++## "Bus arriving soon" notifications (ETA-based)
++
++Parents get an alarm push about **10 minutes before** the bus reaches their
++child's stop, with the expected clock time. Logic: `src/workers/etaWorker.js`
++(DB + queue) and `src/eta/etaCalculator.js` (pure maths, tested by
++`npm run test:eta`).
++
++- **Pickup or drop:** decided by IST time of day (`PICKUP_CUTOFF_HOUR`, default 12).
++- **Stop reached:** bus within 100m of a stop, by GPS — works even if the driver changes the order slightly.
++- **ETA:** time left on the current leg + expected time of each following leg.
++  Leg times start from Mapbox's per-leg durations (+45s boarding) and are
++  replaced by a running average of real trips (`route_segment_stats`).
++  Breakdown-like outliers (>3x or <1/3 normal) are ignored.
++- **Safety net:** also alerts at 500m (`FALLBACK_RADIUS_METERS`) if the ETA is off.
++- **No duplicates:** `notification_log` allows one alert per student per trip, even across restarts.
++- **Siblings:** one notification per parent, naming all their children at that stop.
++- Needs `migration_006_eta_notifications.sql`, and routes regenerated once
++  (`POST /api/routes/:busId/generate`) to get grouped stops + Mapbox leg times.
++  Without a generated route it falls back to distance-based ETAs.
+diff --git a/package.json b/package.json
+index 1ce6d1d..bf60462 100644
+--- a/package.json
++++ b/package.json
+@@ -8,6 +8,7 @@
+     "start": "node src/server.js",
+     "dev": "nodemon src/server.js",
+     "test": "node src/gt06/gt06.test.js",
++    "test:eta": "node src/eta/eta.test.js",
+     "simulate": "node scripts/simulateGt06Device.js"
+   },
+   "dependencies": {
+diff --git a/src/api/routes/routes.js b/src/api/routes/routes.js
+index e3b3735..c000291 100644
+--- a/src/api/routes/routes.js
++++ b/src/api/routes/routes.js
+@@ -1,5 +1,6 @@
+ import express from 'express';
+ import { generateRouteForBus } from '../../routes/routeGenerator.js';
++import { invalidateBusCache } from '../../workers/etaWorker.js';
+ 
+ const router = express.Router();
+ 
+@@ -19,6 +20,7 @@ router.post('/:busId/generate', async (req, res) => {
+     for (const routeType of types) {
+       results.push(await generateRouteForBus(busId, routeType));
+     }
++    invalidateBusCache(busId); // next GPS ping picks up the new stops
+     res.json({ ok: true, results });
+   } catch (err) {
+     console.error(`[API] Route generation failed for bus ${busId}:`, err.message);
+diff --git a/src/db/migration_006_eta_notifications.sql b/src/db/migration_006_eta_notifications.sql
+new file mode 100644
+index 0000000..aedbe0f
+--- /dev/null
++++ b/src/db/migration_006_eta_notifications.sql
+@@ -0,0 +1,58 @@
++-- ============================================================
++-- ETA-based "bus arriving in ~10 minutes" notifications
++-- ============================================================
++-- Replaces the fixed 500m proximity alarm with a time-based alert. Three
++-- backend-only tables (RLS enabled, zero policies — only the Node backend
++-- touches them via service_role):
++--
++--   route_segment_stats — learned stop-to-stop travel times
++--   trip_progress       — which stops a bus has reached on today's trip
++--   notification_log    — one row per alert sent; stops duplicates, survives restarts
++
++-- Learned travel time between two consecutive stops. Keyed by the stops'
++-- rounded coordinates (not their sequence number), so the learning survives
++-- a route regeneration as long as those two stops are still neighbours.
++-- avg_seconds INCLUDES boarding time at the "from" stop.
++create table if not exists route_segment_stats (
++  bus_id uuid not null references buses(id) on delete cascade,
++  route_type text not null check (route_type in ('pickup', 'drop')),
++  segment_key text not null,          -- "lat,lng>lat,lng" rounded to 4 decimals (~11m)
++  avg_seconds double precision not null,
++  samples int not null default 0,
++  updated_at timestamptz not null default now(),
++  primary key (bus_id, route_type, segment_key)
++);
++
++-- Progress of today's trip. Written only when the bus reaches a stop
++-- (not on every ping), so it's cheap, and it lets the backend resume
++-- correctly after a restart mid-trip.
++create table if not exists trip_progress (
++  bus_id uuid not null references buses(id) on delete cascade,
++  service_date date not null,         -- IST date
++  route_type text not null check (route_type in ('pickup', 'drop')),
++  visited jsonb not null default '{}'::jsonb,  -- { "<stop sequence>": "<ISO time reached>" }
++  anchor_index int,                   -- sequence of the most recent stop reached
++  anchor_at timestamptz,
++  updated_at timestamptz not null default now(),
++  primary key (bus_id, service_date, route_type)
++);
++
++-- One row per student per trip per alert kind. The unique key is what
++-- guarantees a parent never gets the same alert twice for the same trip.
++create table if not exists notification_log (
++  id bigserial primary key,
++  student_id uuid not null references students(id) on delete cascade,
++  bus_id uuid references buses(id) on delete set null,
++  service_date date not null,
++  route_type text not null check (route_type in ('pickup', 'drop')),
++  kind text not null default 'ARRIVING_SOON',
++  eta_seconds int,
++  sent_at timestamptz not null default now(),
++  unique (student_id, service_date, route_type, kind)
++);
++
++create index if not exists idx_notification_log_date on notification_log(service_date);
++
++alter table route_segment_stats enable row level security;
++alter table trip_progress enable row level security;
++alter table notification_log enable row level security;
+diff --git a/src/eta/eta.test.js b/src/eta/eta.test.js
+new file mode 100644
+index 0000000..a208294
+--- /dev/null
++++ b/src/eta/eta.test.js
+@@ -0,0 +1,164 @@
++// Run: node src/eta/eta.test.js   (or: npm run test:eta)
++// No database or network needed — tests the pure ETA logic only.
++import assert from 'node:assert/strict';
++import {
++  DEFAULTS, normaliseStops, segmentKey, expectedLegSeconds,
++  detectArrival, computeEtas, learnLeg,
++} from './etaCalculator.js';
++import { groupIntoStops } from '../routes/stopOrdering.js';
++
++let passed = 0;
++function test(name, fn) {
++  fn();
++  passed++;
++  console.log(`  ✓ ${name}`);
++}
++
++// ~111m per 0.001° latitude. Stops laid out northward from Tirur-ish coords.
++const BASE = { lat: 10.9, lng: 75.92 };
++const north = (m) => ({ lat: BASE.lat + m / 111_320, lng: BASE.lng });
++
++console.log('ETA calculator');
++
++test('groups students within 50m into one stop', () => {
++  const stops = groupIntoStops([
++    { id: 'a', ...north(0) },
++    { id: 'b', ...north(30) },   // sibling next door
++    { id: 'c', ...north(400) },
++  ]);
++  assert.equal(stops.length, 2);
++  assert.deepEqual(stops[0].ids, ['a', 'b']);
++});
++
++test('old-format stop_sequence (student_id) still works', () => {
++  const s = normaliseStops([{ sequence: 0, student_id: 'x', lat: 1, lng: 2 }, { sequence: 1, student_id: null, lat: 1, lng: 3 }]);
++  assert.deepEqual(s[0].student_ids, ['x']);
++  assert.deepEqual(s[1].student_ids, []);
++});
++
++const stops = normaliseStops([
++  { sequence: 0, student_ids: ['s0'], ...north(0), baseline_leg_seconds: null },
++  { sequence: 1, student_ids: ['s1'], ...north(1000), baseline_leg_seconds: 180 },
++  { sequence: 2, student_ids: ['s2'], ...north(2000), baseline_leg_seconds: 180 },
++  { sequence: 3, student_ids: [], ...north(3000), baseline_leg_seconds: 180 }, // school
++]);
++const now = new Date('2026-09-28T02:00:00Z');
++
++test('leg time = Mapbox baseline + boarding time', () => {
++  assert.equal(expectedLegSeconds(stops, 2, new Map()), 180 + DEFAULTS.dwellSeconds);
++});
++
++test('learned time overrides Mapbox baseline', () => {
++  const learned = new Map([[segmentKey(stops[1], stops[2]), { avg_seconds: 400 }]]);
++  assert.equal(expectedLegSeconds(stops, 2, learned), 400);
++});
++
++test('ETA subtracts time already spent on the current leg', () => {
++  const anchor = { index: 0, at: new Date(now - 60_000) }; // left stop 0 a minute ago
++  const etas = computeEtas({ stops, visited: { 0: 'x' }, anchor, bus: north(300), now, learned: new Map() });
++  assert.equal(Math.round(etas.get(1)), 225 - 60);
++  assert.equal(Math.round(etas.get(2)), 165 + 225);
++  assert.equal(etas.has(3), false, 'school is never a notification target');
++});
++
++test('bus running late falls back to distance estimate', () => {
++  const anchor = { index: 0, at: new Date(now - 20 * 60_000) }; // stuck 20 min
++  const etas = computeEtas({ stops, visited: { 0: 'x' }, anchor, bus: north(500), now, learned: new Map() });
++  const expected = (500 * DEFAULTS.roadFactor) / (DEFAULTS.avgSpeedKmh / 3.6);
++  assert.ok(Math.abs(etas.get(1) - expected) < 5);
++});
++
++test('stop skipped by driver (behind the anchor) still gets an ETA', () => {
++  const anchor = { index: 2, at: now };
++  const etas = computeEtas({ stops, visited: { 0: 'x', 2: 'x' }, anchor, bus: north(2000), now, learned: new Map() });
++  assert.ok(etas.has(1));
++  assert.ok(etas.get(1) > 0);
++});
++
++test('arrival detected only within 100m, nearest stop wins', () => {
++  assert.equal(detectArrival(stops, {}, north(950)), 1);
++  assert.equal(detectArrival(stops, {}, north(850)), null);
++  assert.equal(detectArrival(stops, { 1: 'x' }, north(990)), null);
++});
++
++test('learning moves toward real time, ignores breakdowns', () => {
++  assert.equal(learnLeg(200, 300), 230);
++  assert.equal(learnLeg(200, 900), null); // 4.5x — outlier
++  assert.equal(learnLeg(null, 250), 250);
++});
++
++// ------------------------------------------------------------------
++// Simulated trip: 8 stops 800m apart, bus drives 18 km/h (slower than the
++// 20 km/h default) and waits 60s at each stop. Mapbox baseline is optimistic
++// (assumes 25 km/h). Check when the alert fires vs the real arrival time,
++// first with no history, then after 5 trips of learning.
++// ------------------------------------------------------------------
++console.log('\nSimulated trip (10s GPS pings)');
++
++function simulate(learned) {
++  const n = 8, gap = 800, speed = 18 / 3.6, dwell = 60, mapboxSpeed = 25 / 3.6;
++  const route = normaliseStops(Array.from({ length: n }, (_, i) => ({
++    sequence: i, student_ids: [`s${i}`], ...north(i * gap),
++    baseline_leg_seconds: i === 0 ? null : gap / mapboxSpeed,
++  })));
++
++  // Real timeline: bus starts 1500m before stop 0.
++  const arriveAt = [];
++  let t = 1500 / speed;
++  for (let i = 0; i < n; i++) { arriveAt.push(t); t += dwell + gap / speed; }
++  const posAt = (sec) => {
++    let m = -1500, clock = 0;
++    for (let i = 0; i < n; i++) {
++      const drive = (i === 0 ? 1500 : gap) / speed;
++      if (sec < clock + drive) return north(m + (sec - clock) * speed);
++      clock += drive; m += i === 0 ? 1500 : gap;
++      if (sec < clock + dwell) return north(m);
++      clock += dwell;
++    }
++    return north(m);
++  };
++
++  const start = Date.parse('2026-09-28T01:30:00Z');
++  const visited = {};
++  let anchor = null;
++  const firedAt = {};
++  const legs = [];
++  for (let sec = 0; sec < t; sec += 10) {
++    const bus = posAt(sec);
++    const nowD = new Date(start + sec * 1000);
++    const hit = detectArrival(route, visited, bus);
++    if (hit != null) {
++      if (anchor && hit === anchor.index + 1) legs.push([anchor.index, hit, (nowD - anchor.at) / 1000]);
++      visited[hit] = 'x';
++      anchor = { index: hit, at: nowD };
++    }
++    const etas = computeEtas({ stops: route, visited, anchor, bus, now: nowD, learned });
++    for (const [i, eta] of etas) {
++      if (firedAt[i] == null && eta <= 600) firedAt[i] = sec;
++    }
++  }
++  // Learn from this trip's real legs.
++  for (const [a, b, s] of legs) {
++    const key = segmentKey(route[a], route[b]);
++    const prev = learned.get(key)?.avg_seconds ?? expectedLegSeconds(route, b, learned);
++    const next = learnLeg(prev, s);
++    if (next != null) learned.set(key, { avg_seconds: next });
++  }
++  // Minutes of warning each parent actually got (stops whose true arrival is >10 min in).
++  return route.map((_, i) => i).filter((i) => arriveAt[i] > 660 && firedAt[i] != null)
++    .map((i) => (arriveAt[i] - firedAt[i]) / 60);
++}
++
++const learned = new Map();
++const fmt = (w) => w.map((m) => m.toFixed(1)).join(', ');
++const trip1 = simulate(learned);
++console.log(`  Trip 1 (no history)  — minutes of warning: ${fmt(trip1)}`);
++for (let i = 0; i < 4; i++) simulate(learned);
++const trip6 = simulate(learned);
++console.log(`  Trip 6 (learned)     — minutes of warning: ${fmt(trip6)}`);
++
++test('after learning, every parent gets 9–11 minutes of warning', () => {
++  trip6.forEach((m) => assert.ok(m >= 9 && m <= 11, `got ${m.toFixed(1)} min`));
++});
++
++console.log(`\n${passed} tests passed`);
+diff --git a/src/eta/etaCalculator.js b/src/eta/etaCalculator.js
+new file mode 100644
+index 0000000..cfd39d7
+--- /dev/null
++++ b/src/eta/etaCalculator.js
+@@ -0,0 +1,154 @@
++import { getDistanceToNextStopInMeters } from '../utils/geoUtils.js';
++
++/**
++ * Pure ETA logic — no database, no network — so it can be unit-tested
++ * (see eta.test.js). etaWorker.js feeds it data and acts on the result.
++ *
++ * A "stop" here is one entry of routes.stop_sequence:
++ *   { sequence, student_ids: [...], lat, lng, baseline_leg_seconds }
++ * baseline_leg_seconds = Mapbox's driving time from the PREVIOUS stop to this
++ * one (no boarding time). The SCHOOL waypoint has student_ids = [].
++ */
++
++export const DEFAULTS = {
++  avgSpeedKmh: 20,        // typical school-bus speed on Kerala roads, incl. junctions
++  maxSpeedKmh: 45,        // physical lower bound: bus can't be faster than this on average
++  roadFactor: 1.4,        // road distance is ~1.4x straight-line distance
++  dwellSeconds: 45,       // boarding/alighting time at each student stop
++  learningRate: 0.3,      // how fast learned times follow new trips (0..1)
++  outlierFactor: 3,       // ignore a leg that took >3x or <1/3 of the expected time
++  arrivalRadiusMeters: 100, // bus within this of a stop = "reached it" (10s pings at ≤36 km/h always land inside)
++};
++
++const toKmhToMps = (kmh) => (kmh * 1000) / 3600;
++
++function dist(a, b) {
++  return getDistanceToNextStopInMeters({ lat: a.lat, lon: a.lng }, { lat: b.lat, lon: b.lng });
++}
++
++/** Stable key for the road between two stops (survives route regeneration). */
++export function segmentKey(from, to) {
++  const r = (n) => Number(n).toFixed(4);
++  return `${r(from.lat)},${r(from.lng)}>${r(to.lat)},${r(to.lng)}`;
++}
++
++/** Normalises old-format stops ({student_id}) and new ones ({student_ids}). */
++export function normaliseStops(stopSequence) {
++  return (stopSequence || []).map((s, i) => ({
++    sequence: s.sequence ?? i,
++    lat: s.lat,
++    lng: s.lng,
++    student_ids: s.student_ids || (s.student_id ? [s.student_id] : []),
++    baseline_leg_seconds: s.baseline_leg_seconds ?? null,
++  }));
++}
++
++/** Rough driving time from a point to a stop using straight-line distance. */
++export function distanceEstimateSeconds(from, to, opts = DEFAULTS) {
++  const d = dist(from, to);
++  if (d == null) return null;
++  return (d * opts.roadFactor) / toKmhToMps(opts.avgSpeedKmh);
++}
++
++/**
++ * Expected seconds from reaching stop k-1 to reaching stop k (boarding time
++ * at k-1 included). Priority: learned average > Mapbox baseline + dwell >
++ * distance estimate + dwell.
++ */
++export function expectedLegSeconds(stops, k, learned, opts = DEFAULTS) {
++  const prev = stops[k - 1];
++  const cur = stops[k];
++  const l = learned?.get(segmentKey(prev, cur));
++  if (l && l.avg_seconds > 0) return l.avg_seconds;
++
++  const dwell = prev.student_ids.length > 0 ? opts.dwellSeconds : 0;
++  if (cur.baseline_leg_seconds != null) return cur.baseline_leg_seconds + dwell;
++  return distanceEstimateSeconds(prev, cur, opts) + dwell;
++}
++
++/**
++ * Returns the index of the nearest not-yet-reached stop within the arrival
++ * radius, or null. Uses GPS position, not the planned order, so a driver who
++ * swaps two stops is still tracked correctly.
++ */
++export function detectArrival(stops, visited, bus, opts = DEFAULTS) {
++  let best = null;
++  let bestD = Infinity;
++  stops.forEach((s, i) => {
++    if (visited[i] != null) return;
++    const d = dist(bus, s);
++    if (d != null && d <= opts.arrivalRadiusMeters && d < bestD) {
++      best = i;
++      bestD = d;
++    }
++  });
++  return best;
++}
++
++/**
++ * ETA in seconds for every not-yet-reached student stop.
++ *
++ * - Stops AFTER the last stop reached: follow the planned order, summing
++ *   expected leg times. For the leg currently being driven, subtract the
++ *   time already spent on it (but never go below what's physically possible).
++ * - Stops BEFORE the last stop reached (driver skipped or reordered): no
++ *   reliable sequence, so use a distance-based estimate.
++ * - ordered=false (no generated route yet): distance-based estimate for all.
++ *
++ * @returns {Map<number, number>} stop index -> eta seconds
++ */
++export function computeEtas({ stops, visited, anchor, bus, now, learned, ordered = true, opts = DEFAULTS }) {
++  const etas = new Map();
++  const isTarget = (i) => stops[i].student_ids.length > 0 && visited[i] == null;
++
++  if (!ordered) {
++    stops.forEach((s, i) => {
++      if (isTarget(i)) etas.set(i, distanceEstimateSeconds(bus, s, opts));
++    });
++    return etas;
++  }
++
++  const a = anchor ? anchor.index : -1;
++
++  // Out-of-order leftovers behind the anchor.
++  for (let i = 0; i <= a; i++) {
++    if (isTarget(i)) etas.set(i, distanceEstimateSeconds(bus, stops[i], opts));
++  }
++
++  const next = a + 1;
++  if (next >= stops.length) return etas;
++
++  // Time to reach the next planned stop.
++  const direct = distanceEstimateSeconds(bus, stops[next], opts);
++  const fastest = (dist(bus, stops[next]) ?? 0) / toKmhToMps(opts.maxSpeedKmh);
++  let t;
++  if (anchor) {
++    const elapsed = (now - anchor.at) / 1000;
++    const left = expectedLegSeconds(stops, next, learned, opts) - elapsed;
++    // Running late (expected time used up) -> fall back to distance estimate.
++    t = left > 0 ? Math.max(left, fastest) : direct;
++  } else {
++    t = direct; // trip just started, no stop reached yet
++  }
++
++  if (isTarget(next)) etas.set(next, t);
++  for (let k = next + 1; k < stops.length; k++) {
++    t += expectedLegSeconds(stops, k, learned, opts);
++    if (isTarget(k)) etas.set(k, t);
++  }
++  return etas;
++}
++
++/**
++ * New learned average after a real leg time, or null if the sample is an
++ * outlier (breakdown, fuel stop, GPS gap) and should be ignored.
++ */
++export function learnLeg(previousAvg, actualSeconds, opts = DEFAULTS) {
++  if (!(actualSeconds > 0)) return null;
++  if (previousAvg > 0) {
++    const ratio = actualSeconds / previousAvg;
++    if (ratio > opts.outlierFactor || ratio < 1 / opts.outlierFactor) return null;
++    return previousAvg + opts.learningRate * (actualSeconds - previousAvg);
++  }
++  return actualSeconds;
++}
+diff --git a/src/routes/mapboxClient.js b/src/routes/mapboxClient.js
+index 9cc8b1f..4bfd198 100644
+--- a/src/routes/mapboxClient.js
++++ b/src/routes/mapboxClient.js
+@@ -12,7 +12,9 @@ const MAPBOX_DIRECTIONS_URL = 'https://api.mapbox.com/directions/v5/mapbox/drivi
+  * response shape here follows Mapbox's documented Directions API v5.
+  *
+  * @param {Array<{lat:number, lng:number}>} orderedPoints - in visit order
+- * @returns {Promise<{polyline: string, distanceMeters: number, durationSeconds: number}>}
++ * @returns {Promise<{polyline: string, distanceMeters: number, durationSeconds: number, legDurations: number[]}>}
++ *   legDurations[i] = driving seconds from point i to point i+1 (used as the
++ *   starting ETA for each stop before real trip times are learned).
+  */
+ export async function fetchRoadRoute(orderedPoints) {
+   if (!process.env.MAPBOX_ACCESS_TOKEN) {
+@@ -23,7 +25,7 @@ export async function fetchRoadRoute(orderedPoints) {
+   }
+   if (orderedPoints.length > 25) {
+     // Mapbox's driving profile caps at 25 waypoints per request.
+-    throw new Error(`Too many stops for a single Directions request (${orderedPoints.length}, max 25) — split into multiple buses/trips`);
++    throw new Error(`Too many stops for a single Directions request (${orderedPoints.length} incl. school, max 25). Students within 50m are already grouped into one stop — split this bus's students across trips or buses.`);
+   }
+ 
+   const coordsParam = orderedPoints.map((p) => `${p.lng},${p.lat}`).join(';');
+@@ -45,5 +47,6 @@ export async function fetchRoadRoute(orderedPoints) {
+     polyline: route.geometry,
+     distanceMeters: route.distance,
+     durationSeconds: route.duration,
++    legDurations: (route.legs || []).map((leg) => leg.duration),
+   };
+ }
+diff --git a/src/routes/routeGenerator.js b/src/routes/routeGenerator.js
+index 179d017..55a5584 100644
+--- a/src/routes/routeGenerator.js
++++ b/src/routes/routeGenerator.js
+@@ -1,5 +1,5 @@
+ import { supabase } from '../db/supabaseClient.js';
+-import { nearestNeighborOrder } from './stopOrdering.js';
++import { nearestNeighborOrder, groupIntoStops } from './stopOrdering.js';
+ import { fetchRoadRoute } from './mapboxClient.js';
+ 
+ /**
+@@ -20,10 +20,10 @@ export function buildWaypointSequence(school, students, routeType) {
+     throw new Error('No students with coordinates assigned to this bus/route type');
+   }
+ 
+-  const points = students.map((s) => ({ id: s.id, lat: s.lat, lng: s.lng }));
++  const points = groupIntoStops(students.map((s) => ({ id: s.id, lat: s.lat, lng: s.lng })));
+   const orderedFromSchool = nearestNeighborOrder({ lat: school.lat, lng: school.lng }, points);
+ 
+-  const schoolWaypoint = { id: 'SCHOOL', lat: school.lat, lng: school.lng };
++  const schoolWaypoint = { id: 'SCHOOL', ids: [], lat: school.lat, lng: school.lng };
+ 
+   if (routeType === 'pickup') {
+     return [...orderedFromSchool].reverse().concat(schoolWaypoint);
+@@ -82,15 +82,20 @@ export async function generateRouteForBus(busId, routeType) {
+     routeType
+   );
+ 
+-  const { polyline, distanceMeters, durationSeconds } = await fetchRoadRoute(
++  const { polyline, distanceMeters, durationSeconds, legDurations } = await fetchRoadRoute(
+     waypoints.map((w) => ({ lat: w.lat, lng: w.lng }))
+   );
+ 
+   const stopSequence = waypoints.map((w, index) => ({
+     sequence: index,
++    // student_id kept for existing app/dashboard code (first student at the stop);
++    // student_ids lists everyone boarding/alighting here.
+     student_id: w.id === 'SCHOOL' ? null : w.id,
++    student_ids: w.ids,
+     lat: w.lat,
+     lng: w.lng,
++    // Mapbox driving time from the previous stop to this one (null for the first).
++    baseline_leg_seconds: index === 0 ? null : legDurations?.[index - 1] ?? null,
+   }));
+ 
+   const { error: upsertError } = await supabase.from('routes').upsert(
+@@ -107,5 +112,5 @@ export async function generateRouteForBus(busId, routeType) {
+   );
+   if (upsertError) throw new Error(`Failed to save route: ${upsertError.message}`);
+ 
+-  return { busId, routeType, stopCount: points.length, distanceMeters, durationSeconds };
++  return { busId, routeType, studentCount: points.length, stopCount: waypoints.length - 1, distanceMeters, durationSeconds };
+ }
+diff --git a/src/routes/stopOrdering.js b/src/routes/stopOrdering.js
+index b91fdd4..8460821 100644
+--- a/src/routes/stopOrdering.js
++++ b/src/routes/stopOrdering.js
+@@ -39,3 +39,26 @@ export function nearestNeighborOrder(origin, points) {
+ 
+   return ordered;
+ }
++
++// Students whose points are within this distance share one stop (siblings,
++// same apartment, same junction). Fewer stops = cleaner ETAs and stays under
++// Mapbox's 25-waypoint limit.
++const STOP_GROUP_RADIUS_METERS = 50;
++
++/**
++ * Groups students into stops. Greedy: each student joins the first existing
++ * stop within STOP_GROUP_RADIUS_METERS of that stop's first student, else
++ * starts a new stop. Returns [{ id, ids, lat, lng }].
++ */
++export function groupIntoStops(points) {
++  const stops = [];
++  for (const p of points) {
++    const near = stops.find((s) => {
++      const d = getDistanceToNextStopInMeters({ lat: s.lat, lon: s.lng }, { lat: p.lat, lon: p.lng });
++      return d != null && d <= STOP_GROUP_RADIUS_METERS;
++    });
++    if (near) near.ids.push(p.id);
++    else stops.push({ id: p.id, ids: [p.id], lat: p.lat, lng: p.lng });
++  }
++  return stops;
++}
+diff --git a/src/server.js b/src/server.js
+index b01b0aa..417eb0b 100644
+--- a/src/server.js
++++ b/src/server.js
+@@ -2,7 +2,7 @@ import 'dotenv/config';
+ import express from 'express';
+ import { startGt06Server } from './gt06/tcpServer.js';
+ import { evaluateTripState } from './workers/tripStateWorker.js';
+-import { checkProximityAlarms } from './workers/proximityWorker.js';
++import { checkArrivalEtas } from './workers/etaWorker.js';
+ import { startNotificationWorker } from './workers/notificationWorker.js';
+ import tripsRouter from './api/routes/trips.js';
+ import routesRouter from './api/routes/routes.js';
+@@ -29,9 +29,9 @@ async function main() {
+         console.error('[TripState] evaluation failed:', err.message);
+       }
+       try {
+-        await checkProximityAlarms({ busId, latitude, longitude });
++        await checkArrivalEtas({ busId, latitude, longitude });
+       } catch (err) {
+-        console.error('[Proximity] check failed:', err.message);
++        console.error('[ETA] check failed:', err.message);
+       }
+     },
+   });
+diff --git a/src/workers/etaWorker.js b/src/workers/etaWorker.js
+new file mode 100644
+index 0000000..e075e9f
+--- /dev/null
++++ b/src/workers/etaWorker.js
+@@ -0,0 +1,375 @@
++import { supabase } from '../db/supabaseClient.js';
++import { getQueue, JOBS } from '../queue/queue.js';
++import { getDistanceToNextStopInMeters } from '../utils/geoUtils.js';
++import {
++  DEFAULTS,
++  normaliseStops,
++  segmentKey,
++  expectedLegSeconds,
++  detectArrival,
++  computeEtas,
++  learnLeg,
++} from '../eta/etaCalculator.js';
++
++/**
++ * "Bus arriving in ~10 minutes" notifications. Replaces proximityWorker.js.
++ *
++ * On every GPS ping (every 10s):
++ *   1. Work out today's route (pickup before PICKUP_CUTOFF_HOUR IST, else drop).
++ *   2. If the bus has reached a stop, record it and learn that leg's real time.
++ *   3. Compute an ETA for every student stop not yet reached.
++ *   4. Alert parents when ETA <= ETA_ALERT_SECONDS, or as a safety net when the
++ *      bus is within FALLBACK_RADIUS_METERS — once per student per trip.
++ *
++ * DB reads are cached (route 5 min, roster 60s, trip state 15s), so a normal
++ * ping does no DB queries at all. Writes happen only when a stop is reached
++ * or an alert is sent.
++ */
++
++const ETA_ALERT_SECONDS = Number(process.env.ETA_ALERT_SECONDS || 600);
++const FALLBACK_RADIUS_METERS = Number(process.env.FALLBACK_RADIUS_METERS || 500);
++const PICKUP_CUTOFF_HOUR = Number(process.env.PICKUP_CUTOFF_HOUR || 12);
++// Only alert while a trip is running (driver tapped Start, or auto-detected).
++// Stops false alerts when a bus moves on a holiday or for maintenance.
++const REQUIRE_TRIP_IN_PROGRESS = process.env.REQUIRE_TRIP_IN_PROGRESS !== 'false';
++const MAX_LEG_SECONDS_TO_LEARN = 30 * 60;
++const TZ = 'Asia/Kolkata';
++
++// ---------- time helpers (IST) ----------
++
++function serviceDate(d = new Date()) {
++  return d.toLocaleDateString('en-CA', { timeZone: TZ }); // YYYY-MM-DD
++}
++
++function routeTypeFor(d = new Date()) {
++  const hour = Number(new Intl.DateTimeFormat('en-GB', { timeZone: TZ, hour: '2-digit', hour12: false }).format(d));
++  return hour < PICKUP_CUTOFF_HOUR ? 'pickup' : 'drop';
++}
++
++function clockTime(d) {
++  return d.toLocaleTimeString('en-IN', { timeZone: TZ, hour: 'numeric', minute: '2-digit', hour12: true }).toUpperCase();
++}
++
++// ---------- caches ----------
++
++function ttlCache(ttlMs) {
++  const m = new Map();
++  return {
++    get(k) {
++      const e = m.get(k);
++      return e && Date.now() - e.at < ttlMs ? e.v : undefined;
++    },
++    set(k, v) { m.set(k, { v, at: Date.now() }); },
++    delete(k) { m.delete(k); },
++  };
++}
++
++const routeCache = ttlCache(5 * 60 * 1000);   // `${busId}:${type}` -> { stops, ordered, learned }
++const rosterCache = ttlCache(60 * 1000);      // `${busId}:${type}` -> roster
++const tripCache = ttlCache(15 * 1000);        // busId -> boolean running
++
++// Per-day state, cleared when the IST date changes.
++let currentDay = null;
++const progressByKey = new Map(); // `${busId}:${type}` -> { visited, anchor }
++const alerted = new Set();       // `${type}:${studentId}` already notified today
++
++function rollDay(today) {
++  if (currentDay === today) return;
++  currentDay = today;
++  progressByKey.clear();
++  alerted.clear();
++}
++
++// ---------- loaders ----------
++
++async function isTripRunning(busId) {
++  const cached = tripCache.get(busId);
++  if (cached !== undefined) return cached;
++  const { data } = await supabase.from('trip_state').select('status, started_at').eq('bus_id', busId).maybeSingle();
++  const running = data?.status === 'IN_PROGRESS'
++    && (!data.started_at || serviceDate(new Date(data.started_at)) === serviceDate());
++  tripCache.set(busId, running);
++  return running;
++}
++
++async function loadLearned(busId, type) {
++  const { data, error } = await supabase
++    .from('route_segment_stats')
++    .select('segment_key, avg_seconds, samples')
++    .eq('bus_id', busId)
++    .eq('route_type', type);
++  if (error) console.error('[ETA] segment stats load failed:', error.message);
++  return new Map((data || []).map((r) => [r.segment_key, r]));
++}
++
++/** Loads the roster: students on this bus, their stop coords, parents, bus number. */
++async function getRoster(busId, type) {
++  const key = `${busId}:${type}`;
++  const cached = rosterCache.get(key);
++  if (cached) return cached;
++
++  const [latF, lngF] = type === 'pickup' ? ['pickup_lat', 'pickup_lng'] : ['drop_lat', 'drop_lng'];
++  const [{ data: students, error }, { data: bus }] = await Promise.all([
++    supabase.from('students').select(`id, full_name, ${latF}, ${lngF}`).eq('bus_id', busId),
++    supabase.from('buses').select('bus_number').eq('id', busId).maybeSingle(),
++  ]);
++  if (error) {
++    console.error(`[ETA] roster load failed for bus ${busId}:`, error.message);
++    return null;
++  }
++
++  const ids = (students || []).map((s) => s.id);
++  const parentsOf = new Map();
++  let absent = new Set();
++  if (ids.length > 0) {
++    const { data: links } = await supabase
++      .from('parent_student_links')
++      .select('student_id, parent_user_id')
++      .in('student_id', ids);
++    for (const l of links || []) {
++      if (!parentsOf.has(l.student_id)) parentsOf.set(l.student_id, []);
++      parentsOf.get(l.student_id).push(l.parent_user_id);
++    }
++    // Drop trip only: a student marked absent today isn't on the bus.
++    if (type === 'drop') {
++      const { data: att } = await supabase
++        .from('attendance')
++        .select('student_id')
++        .eq('date', serviceDate())
++        .eq('present', false)
++        .in('student_id', ids);
++      absent = new Set((att || []).map((a) => a.student_id));
++    }
++  }
++
++  const roster = {
++    busNumber: bus?.bus_number || 'The bus',
++    students: new Map((students || []).map((s) => [s.id, { ...s, lat: s[latF], lng: s[lngF] }])),
++    parentsOf,
++    absent,
++  };
++  rosterCache.set(key, roster);
++  return roster;
++}
++
++/**
++ * The stops for this trip. Uses the generated route when there is one;
++ * otherwise falls back to one unordered stop per student (distance-based
++ * ETAs only), so alerts still work before a route is generated.
++ */
++async function getStops(busId, type, roster) {
++  const key = `${busId}:${type}`;
++  const cached = routeCache.get(key);
++  if (cached) return cached;
++
++  const { data: route } = await supabase
++    .from('routes')
++    .select('stop_sequence')
++    .eq('bus_id', busId)
++    .eq('route_type', type)
++    .maybeSingle();
++
++  let result;
++  if (route?.stop_sequence?.length) {
++    result = {
++      stops: normaliseStops(route.stop_sequence),
++      ordered: true,
++      learned: await loadLearned(busId, type),
++    };
++  } else {
++    const stops = [...roster.students.values()]
++      .filter((s) => s.lat != null && s.lng != null)
++      .map((s, i) => ({ sequence: i, lat: s.lat, lng: s.lng, student_ids: [s.id], baseline_leg_seconds: null }));
++    result = { stops, ordered: false, learned: new Map() };
++  }
++  routeCache.set(key, result);
++  return result;
++}
++
++async function getProgress(busId, type, today) {
++  const key = `${busId}:${type}`;
++  if (progressByKey.has(key)) return progressByKey.get(key);
++
++  const { data } = await supabase
++    .from('trip_progress')
++    .select('visited, anchor_index, anchor_at')
++    .eq('bus_id', busId)
++    .eq('service_date', today)
++    .eq('route_type', type)
++    .maybeSingle();
++
++  const progress = {
++    visited: data?.visited || {},
++    anchor: data?.anchor_index != null ? { index: data.anchor_index, at: new Date(data.anchor_at) } : null,
++  };
++  progressByKey.set(key, progress);
++  return progress;
++}
++
++// ---------- writers ----------
++
++async function saveProgress(busId, type, today, progress) {
++  const { error } = await supabase.from('trip_progress').upsert(
++    {
++      bus_id: busId,
++      service_date: today,
++      route_type: type,
++      visited: progress.visited,
++      anchor_index: progress.anchor?.index ?? null,
++      anchor_at: progress.anchor?.at?.toISOString() ?? null,
++      updated_at: new Date().toISOString(),
++    },
++    { onConflict: 'bus_id,service_date,route_type' }
++  );
++  if (error) console.error('[ETA] saving trip progress failed:', error.message);
++}
++
++/** Learns the real time of the leg just driven, if it was the planned next stop. */
++async function recordLeg(busId, type, route, fromIdx, toIdx, seconds) {
++  if (!route.ordered || toIdx !== fromIdx + 1 || seconds > MAX_LEG_SECONDS_TO_LEARN) return;
++
++  const { stops, learned } = route;
++  // Don't learn the leg leaving school on a drop trip: it includes waiting
++  // at school while children board, which isn't road time.
++  if (stops[fromIdx].student_ids.length === 0) return;
++  const key = segmentKey(stops[fromIdx], stops[toIdx]);
++  const prev = learned.get(key);
++  const prevAvg = prev?.avg_seconds ?? expectedLegSeconds(stops, toIdx, learned);
++  const next = learnLeg(prevAvg, seconds);
++  if (next == null) {
++    console.log(`[ETA] bus ${busId}: ignored outlier leg ${fromIdx}->${toIdx} (${Math.round(seconds)}s vs ~${Math.round(prevAvg)}s)`);
++    return;
++  }
++
++  const row = { segment_key: key, avg_seconds: next, samples: (prev?.samples || 0) + 1 };
++  learned.set(key, row);
++  const { error } = await supabase.from('route_segment_stats').upsert(
++    { bus_id: busId, route_type: type, ...row, updated_at: new Date().toISOString() },
++    { onConflict: 'bus_id,route_type,segment_key' }
++  );
++  if (error) console.error('[ETA] saving segment stats failed:', error.message);
++}
++
++/**
++ * Claims the alert in notification_log (the unique key makes this safe even
++ * across restarts), then queues one push per parent. Siblings at the same
++ * stop are combined into a single notification for their shared parent.
++ */
++async function sendArrivingAlerts({ busId, type, today, roster, studentIds, etaSeconds, now }) {
++  const candidates = studentIds.filter((id) => !alerted.has(`${type}:${id}`) && !roster.absent.has(id));
++  if (candidates.length === 0) return;
++
++  const { data: claimed, error } = await supabase
++    .from('notification_log')
++    .upsert(
++      candidates.map((id) => ({
++        student_id: id,
++        bus_id: busId,
++        service_date: today,
++        route_type: type,
++        kind: 'ARRIVING_SOON',
++        eta_seconds: Math.round(etaSeconds),
++      })),
++      { onConflict: 'student_id,service_date,route_type,kind', ignoreDuplicates: true }
++    )
++    .select('student_id');
++  if (error) {
++    console.error('[ETA] notification_log claim failed (will retry next ping):', error.message);
++    return;
++  }
++
++  // Everything in candidates is now either claimed by us or already sent before.
++  candidates.forEach((id) => alerted.add(`${type}:${id}`));
++  if (!claimed?.length) return;
++
++  // Group claimed students by parent so siblings share one notification.
++  const byParent = new Map();
++  for (const { student_id } of claimed) {
++    for (const parentId of roster.parentsOf.get(student_id) || []) {
++      if (!byParent.has(parentId)) byParent.set(parentId, []);
++      byParent.get(parentId).push(student_id);
++    }
++  }
++
++  const minutes = Math.max(1, Math.round(etaSeconds / 60));
++  const at = clockTime(new Date(now.getTime() + etaSeconds * 1000));
++  const point = type === 'pickup' ? 'pickup' : 'drop';
++  const queue = await getQueue();
++
++  for (const [parentId, ids] of byParent) {
++    const names = ids.map((id) => roster.students.get(id)?.full_name?.split(' ')[0] || 'your child');
++    const who = names.length > 1 ? `${names.slice(0, -1).join(', ')} & ${names.at(-1)}` : names[0];
++    await queue.send(JOBS.DISPATCH_NOTIFICATION, {
++      type: 'PROXIMITY_ALARM', // keeps the alarm sound channel in the parent app
++      parentUserIds: [parentId],
++      studentIds: ids,
++      busId,
++      title: `Bus arriving in about ${minutes} min`,
++      body: `${roster.busNumber} will reach ${who}'s ${point} point in about ${minutes} minutes (around ${at}).`,
++    });
++  }
++  console.log(`[ETA] bus ${busId}: alert queued for ${claimed.length} student(s), ETA ${minutes} min`);
++}
++
++// ---------- main entry, called for every GPS ping ----------
++
++export async function checkArrivalEtas({ busId, latitude, longitude }) {
++  if (latitude == null || longitude == null) return;
++  const now = new Date();
++  const today = serviceDate(now);
++  rollDay(today);
++
++  if (REQUIRE_TRIP_IN_PROGRESS && !(await isTripRunning(busId))) return;
++
++  const type = routeTypeFor(now);
++  const roster = await getRoster(busId, type);
++  if (!roster || roster.students.size === 0) return;
++
++  const route = await getStops(busId, type, roster);
++  if (route.stops.length === 0) return;
++
++  const progress = await getProgress(busId, type, today);
++  const bus = { lat: latitude, lng: longitude };
++
++  // 1. Did the bus just reach a stop?
++  const reached = detectArrival(route.stops, progress.visited, bus);
++  if (reached != null) {
++    if (progress.anchor) {
++      const seconds = (now - progress.anchor.at) / 1000;
++      await recordLeg(busId, type, route, progress.anchor.index, reached, seconds);
++    }
++    progress.visited[reached] = now.toISOString();
++    progress.anchor = { index: reached, at: now };
++    await saveProgress(busId, type, today, progress);
++    // A student stop that's been reached no longer needs an alert.
++    route.stops[reached].student_ids.forEach((id) => alerted.add(`${type}:${id}`));
++  }
++
++  // 2. ETAs for every remaining student stop, and alerts when due.
++  const etas = computeEtas({
++    stops: route.stops,
++    visited: progress.visited,
++    anchor: progress.anchor,
++    bus,
++    now,
++    learned: route.learned,
++    ordered: route.ordered,
++    opts: DEFAULTS,
++  });
++
++  for (const [idx, eta] of etas) {
++    const stop = route.stops[idx];
++    const distance = getDistanceToNextStopInMeters({ lat: latitude, lon: longitude }, { lat: stop.lat, lon: stop.lng });
++    const due = eta <= ETA_ALERT_SECONDS || (distance != null && distance <= FALLBACK_RADIUS_METERS);
++    if (!due) continue;
++    await sendArrivingAlerts({ busId, type, today, roster, studentIds: stop.student_ids, etaSeconds: eta, now });
++  }
++}
++
++/** Call after a route is regenerated so the next ping uses the new stops. */
++export function invalidateBusCache(busId) {
++  for (const type of ['pickup', 'drop']) {
++    routeCache.delete(`${busId}:${type}`);
++    rosterCache.delete(`${busId}:${type}`);
++  }
++}
+diff --git a/src/workers/notificationWorker.js b/src/workers/notificationWorker.js
+index 440a915..2cc5581 100644
+--- a/src/workers/notificationWorker.js
++++ b/src/workers/notificationWorker.js
+@@ -43,7 +43,10 @@ async function getMessaging() {
+ async function tokensForNotification(job) {
+   let parentUserIds = [];
+ 
+-  if (job.studentId) {
++  if (job.parentUserIds?.length) {
++    // Already resolved by the sender (ETA alerts group siblings per parent).
++    parentUserIds = job.parentUserIds;
++  } else if (job.studentId) {
+     // Proximity alarm / student-specific: only that student's parents.
+     const { data: links } = await supabase
+       .from('parent_student_links')
+@@ -100,6 +103,7 @@ async function handleDispatch(job) {
+       title: job.title || 'Evide School Bus',
+       body: job.body || '',
+       ...(job.studentId ? { studentId: String(job.studentId) } : {}),
++      ...(job.studentIds ? { studentIds: job.studentIds.join(',') } : {}),
+       ...(job.busId ? { busId: String(job.busId) } : {}),
+     },
+     android: {
+diff --git a/src/workers/proximityWorker.js b/src/workers/proximityWorker.js
+deleted file mode 100644
+index 8a6aa58..0000000
+--- a/src/workers/proximityWorker.js
++++ /dev/null
+@@ -1,89 +0,0 @@
+-import { supabase } from '../db/supabaseClient.js';
+-import { getQueue, JOBS } from '../queue/queue.js';
+-import { getDistanceToNextStopInMeters } from '../utils/geoUtils.js';
+-
+-// Fire an alarm when the bus comes within this distance of a student's stop.
+-const ALARM_RADIUS_METERS = 500;
+-
+-// Don't re-fire the same student's alarm more than once per this window
+-// (prevents spamming while the bus lingers near the stop). Keyed per
+-// student+stop-type+day in memory. For a single-process MVP this is fine;
+-// move to a table if you ever run multiple backend instances.
+-const COOLDOWN_MS = 15 * 60 * 1000; // 15 minutes
+-const lastAlarmAt = new Map(); // key: `${studentId}:${type}` -> timestamp
+-
+-function todayKey() {
+-  const d = new Date();
+-  return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+-}
+-
+-// Cache of bus_id -> students (with pickup/drop coords), refreshed periodically
+-// so we're not hitting the DB for the roster on every single GPS ping.
+-const rosterCache = new Map(); // bus_id -> { students, fetchedAt }
+-const ROSTER_TTL_MS = 60 * 1000;
+-
+-async function getRoster(busId) {
+-  const cached = rosterCache.get(busId);
+-  if (cached && Date.now() - cached.fetchedAt < ROSTER_TTL_MS) {
+-    return cached.students;
+-  }
+-  const { data, error } = await supabase
+-    .from('students')
+-    .select('id, full_name, pickup_lat, pickup_lng, drop_lat, drop_lng')
+-    .eq('bus_id', busId);
+-  if (error) {
+-    console.error(`[Proximity] roster load failed for bus ${busId}:`, error.message);
+-    return cached?.students || [];
+-  }
+-  rosterCache.set(busId, { students: data || [], fetchedAt: Date.now() });
+-  return data || [];
+-}
+-
+-/**
+- * Call for every GPS ping. Checks the bus against each student's pickup and
+- * drop point; when within ALARM_RADIUS_METERS (and past cooldown), enqueues a
+- * proximity-alarm notification for that student's parents.
+- *
+- * Which point matters depends on the trip: in the morning the pickup point,
+- * in the afternoon the drop point. For the MVP we check BOTH — a bus only
+- * gets near a student's pickup OR drop point at the relevant time anyway, so
+- * checking both is simplest and correct in practice. Refine with trip
+- * direction later if needed.
+- */
+-export async function checkProximityAlarms({ busId, latitude, longitude }) {
+-  const students = await getRoster(busId);
+-  if (students.length === 0) return;
+-
+-  const dayKey = todayKey();
+-  const queue = await getQueue();
+-
+-  for (const s of students) {
+-    for (const type of ['pickup', 'drop']) {
+-      const lat = type === 'pickup' ? s.pickup_lat : s.drop_lat;
+-      const lng = type === 'pickup' ? s.pickup_lng : s.drop_lng;
+-      if (lat == null || lng == null) continue;
+-
+-      const dist = getDistanceToNextStopInMeters(
+-        { lat: latitude, lon: longitude },
+-        { lat, lon: lng }
+-      );
+-      if (dist == null || dist > ALARM_RADIUS_METERS) continue;
+-
+-      const key = `${s.id}:${type}:${dayKey}`;
+-      const last = lastAlarmAt.get(key) || 0;
+-      if (Date.now() - last < COOLDOWN_MS) continue;
+-
+-      lastAlarmAt.set(key, Date.now());
+-      await queue.send(JOBS.DISPATCH_NOTIFICATION, {
+-        type: 'PROXIMITY_ALARM',
+-        studentId: s.id,
+-        busId,
+-        stopType: type,
+-        distanceMeters: Math.round(dist),
+-        title: 'Bus is approaching',
+-        body: `The bus is about ${Math.round(dist)}m from ${s.full_name}'s ${type} point.`,
+-      });
+-      console.log(`[Proximity] ALARM queued: ${s.full_name} ${type} (${Math.round(dist)}m)`);
+-    }
+-  }
+-}

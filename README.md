@@ -186,3 +186,23 @@ from `fetchRoadRoute` will surface Mapbox's actual error text to help debug.
 
 To generate both pickup and drop in one call, omit `"type"` from the body.
 
+
+## "Bus arriving soon" notifications (ETA-based)
+
+Parents get an alarm push about **10 minutes before** the bus reaches their
+child's stop, with the expected clock time. Logic: `src/workers/etaWorker.js`
+(DB + queue) and `src/eta/etaCalculator.js` (pure maths, tested by
+`npm run test:eta`).
+
+- **Pickup or drop:** decided by IST time of day (`PICKUP_CUTOFF_HOUR`, default 12).
+- **Stop reached:** bus within 100m of a stop, by GPS — works even if the driver changes the order slightly.
+- **ETA:** time left on the current leg + expected time of each following leg.
+  Leg times start from Mapbox's per-leg durations (+45s boarding) and are
+  replaced by a running average of real trips (`route_segment_stats`).
+  Breakdown-like outliers (>3x or <1/3 normal) are ignored.
+- **Safety net:** also alerts at 500m (`FALLBACK_RADIUS_METERS`) if the ETA is off.
+- **No duplicates:** `notification_log` allows one alert per student per trip, even across restarts.
+- **Siblings:** one notification per parent, naming all their children at that stop.
+- Needs `migration_006_eta_notifications.sql`, and routes regenerated once
+  (`POST /api/routes/:busId/generate`) to get grouped stops + Mapbox leg times.
+  Without a generated route it falls back to distance-based ETAs.

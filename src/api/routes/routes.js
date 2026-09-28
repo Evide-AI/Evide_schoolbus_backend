@@ -1,5 +1,6 @@
 import express from 'express';
 import { generateRouteForBus } from '../../routes/routeGenerator.js';
+import { invalidateBusCache } from '../../workers/etaWorker.js';
 
 const router = express.Router();
 
@@ -19,6 +20,7 @@ router.post('/:busId/generate', async (req, res) => {
     for (const routeType of types) {
       results.push(await generateRouteForBus(busId, routeType));
     }
+    invalidateBusCache(busId); // next GPS ping picks up the new stops
     res.json({ ok: true, results });
   } catch (err) {
     console.error(`[API] Route generation failed for bus ${busId}:`, err.message);

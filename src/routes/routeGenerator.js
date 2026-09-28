@@ -1,5 +1,5 @@
 import { supabase } from '../db/supabaseClient.js';
-import { nearestNeighborOrder } from './stopOrdering.js';
+import { nearestNeighborOrder, groupIntoStops } from './stopOrdering.js';
 import { fetchRoadRoute } from './mapboxClient.js';
 
 /**
@@ -20,10 +20,10 @@ export function buildWaypointSequence(school, students, routeType) {
     throw new Error('No students with coordinates assigned to this bus/route type');
   }
 
-  const points = students.map((s) => ({ id: s.id, lat: s.lat, lng: s.lng }));
+  const points = groupIntoStops(students.map((s) => ({ id: s.id, lat: s.lat, lng: s.lng })));
   const orderedFromSchool = nearestNeighborOrder({ lat: school.lat, lng: school.lng }, points);
 
-  const schoolWaypoint = { id: 'SCHOOL', lat: school.lat, lng: school.lng };
+  const schoolWaypoint = { id: 'SCHOOL', ids: [], lat: school.lat, lng: school.lng };
 
   if (routeType === 'pickup') {
     return [...orderedFromSchool].reverse().concat(schoolWaypoint);
@@ -82,15 +82,20 @@ export async function generateRouteForBus(busId, routeType) {
     routeType
   );
 
-  const { polyline, distanceMeters, durationSeconds } = await fetchRoadRoute(
+  const { polyline, distanceMeters, durationSeconds, legDurations } = await fetchRoadRoute(
     waypoints.map((w) => ({ lat: w.lat, lng: w.lng }))
   );
 
   const stopSequence = waypoints.map((w, index) => ({
     sequence: index,
+    // student_id kept for existing app/dashboard code (first student at the stop);
+    // student_ids lists everyone boarding/alighting here.
     student_id: w.id === 'SCHOOL' ? null : w.id,
+    student_ids: w.ids,
     lat: w.lat,
     lng: w.lng,
+    // Mapbox driving time from the previous stop to this one (null for the first).
+    baseline_leg_seconds: index === 0 ? null : legDurations?.[index - 1] ?? null,
   }));
 
   const { error: upsertError } = await supabase.from('routes').upsert(
@@ -107,5 +112,5 @@ export async function generateRouteForBus(busId, routeType) {
   );
   if (upsertError) throw new Error(`Failed to save route: ${upsertError.message}`);
 
-  return { busId, routeType, stopCount: points.length, distanceMeters, durationSeconds };
+  return { busId, routeType, studentCount: points.length, stopCount: waypoints.length - 1, distanceMeters, durationSeconds };
 }

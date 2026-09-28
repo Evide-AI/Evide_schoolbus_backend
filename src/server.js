@@ -2,7 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import { startGt06Server } from './gt06/tcpServer.js';
 import { evaluateTripState } from './workers/tripStateWorker.js';
-import { checkProximityAlarms } from './workers/proximityWorker.js';
+import { checkArrivalEtas } from './workers/etaWorker.js';
 import { startNotificationWorker } from './workers/notificationWorker.js';
 import tripsRouter from './api/routes/trips.js';
 import routesRouter from './api/routes/routes.js';
@@ -29,9 +29,9 @@ async function main() {
         console.error('[TripState] evaluation failed:', err.message);
       }
       try {
-        await checkProximityAlarms({ busId, latitude, longitude });
+        await checkArrivalEtas({ busId, latitude, longitude });
       } catch (err) {
-        console.error('[Proximity] check failed:', err.message);
+        console.error('[ETA] check failed:', err.message);
       }
     },
   });

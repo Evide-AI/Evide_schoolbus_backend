@@ -8,6 +8,7 @@
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
     "test": "node src/gt06/gt06.test.js",
+    "test:eta": "node src/eta/eta.test.js",
     "simulate": "node scripts/simulateGt06Device.js"
   },
   "dependencies": {

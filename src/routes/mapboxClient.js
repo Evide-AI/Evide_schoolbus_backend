@@ -12,7 +12,9 @@ const MAPBOX_DIRECTIONS_URL = 'https://api.mapbox.com/directions/v5/mapbox/drivi
  * response shape here follows Mapbox's documented Directions API v5.
  *
  * @param {Array<{lat:number, lng:number}>} orderedPoints - in visit order
- * @returns {Promise<{polyline: string, distanceMeters: number, durationSeconds: number}>}
+ * @returns {Promise<{polyline: string, distanceMeters: number, durationSeconds: number, legDurations: number[]}>}
+ *   legDurations[i] = driving seconds from point i to point i+1 (used as the
+ *   starting ETA for each stop before real trip times are learned).
  */
 export async function fetchRoadRoute(orderedPoints) {
   if (!process.env.MAPBOX_ACCESS_TOKEN) {
@@ -23,7 +25,7 @@ export async function fetchRoadRoute(orderedPoints) {
   }
   if (orderedPoints.length > 25) {
     // Mapbox's driving profile caps at 25 waypoints per request.
-    throw new Error(`Too many stops for a single Directions request (${orderedPoints.length}, max 25) — split into multiple buses/trips`);
+    throw new Error(`Too many stops for a single Directions request (${orderedPoints.length} incl. school, max 25). Students within 50m are already grouped into one stop — split this bus's students across trips or buses.`);
   }
 
   const coordsParam = orderedPoints.map((p) => `${p.lng},${p.lat}`).join(';');
@@ -45,5 +47,6 @@ export async function fetchRoadRoute(orderedPoints) {
     polyline: route.geometry,
     distanceMeters: route.distance,
     durationSeconds: route.duration,
+    legDurations: (route.legs || []).map((leg) => leg.duration),
   };
 }

@@ -43,7 +43,10 @@ async function getMessaging() {
 async function tokensForNotification(job) {
   let parentUserIds = [];
 
-  if (job.studentId) {
+  if (job.parentUserIds?.length) {
+    // Already resolved by the sender (ETA alerts group siblings per parent).
+    parentUserIds = job.parentUserIds;
+  } else if (job.studentId) {
     // Proximity alarm / student-specific: only that student's parents.
     const { data: links } = await supabase
       .from('parent_student_links')
@@ -100,6 +103,7 @@ async function handleDispatch(job) {
       title: job.title || 'Evide School Bus',
       body: job.body || '',
       ...(job.studentId ? { studentId: String(job.studentId) } : {}),
+      ...(job.studentIds ? { studentIds: job.studentIds.join(',') } : {}),
       ...(job.busId ? { busId: String(job.busId) } : {}),
     },
     android: {
