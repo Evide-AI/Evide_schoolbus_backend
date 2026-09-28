@@ -77,7 +77,19 @@ async function tokensForNotification(job) {
   return [...new Set((tokens || []).map((t) => t.fcm_token))];
 }
 
+// Student-specific notifications (attendance, absent) must never fall through
+// to the bus-wide branch — that would push one child's update to every parent
+// on the bus.
+function isStudentSpecific(job) {
+  const kind = String(job.category || job.type || '').toUpperCase();
+  return kind.includes('ATTENDANCE') || kind.includes('ABSENT');
+}
+
 async function handleDispatch(job) {
+  if (isStudentSpecific(job) && !job.studentId && !job.parentUserIds?.length) {
+    console.warn(`[FCM] Dropped ${job.type || job.category}: student-specific push with no studentId (would have gone to the whole bus).`);
+    return;
+  }
   const tokens = await tokensForNotification(job);
   if (tokens.length === 0) {
     console.log(`[FCM] No device tokens for job ${job.type} — nothing to send (parents may not have opened the app yet).`);
