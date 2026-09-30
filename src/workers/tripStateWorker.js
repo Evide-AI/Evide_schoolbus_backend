@@ -1,6 +1,7 @@
 import { supabase } from '../db/supabaseClient.js';
 import { getQueue, JOBS } from '../queue/queue.js';
 import { getDistanceToNextStopInMeters } from '../utils/geoUtils.js';
+import { currentWindowForBus } from '../utils/schoolHours.js';
 
 // Tunable thresholds — expect to adjust these after your first real field
 // test, per the roadmap's open items. These are reasonable starting points,
@@ -35,12 +36,28 @@ async function setTripState(busId, status, triggeredBy) {
 
   await supabase.from('trip_state').upsert(update, { onConflict: 'bus_id' });
 
-  const queue = await getQueue();
-  await queue.send(JOBS.DISPATCH_NOTIFICATION, {
-    type: status === 'IN_PROGRESS' ? 'BUS_STARTED' : 'BUS_REACHED',
-    busId,
-    triggeredBy,
-  });
+  // Mirror the trip into buses.status so the parent app (which can read
+  // buses but not trip_state) can show Running / Not running.
+  // A bus marked 'maintenance' is left alone.
+  const busStatus = status === 'IN_PROGRESS' ? 'running' : 'not_running';
+  const { error: busErr } = await supabase
+    .from('buses')
+    .update({ status: busStatus })
+    .eq('id', busId)
+    .neq('status', 'maintenance');
+  if (busErr) console.error('[trip] failed to sync buses.status:', busErr.message);
+
+  // Only "bus started" goes to the whole bus, and only during school hours.
+  // "Reached school / reached stop" are now sent per student by
+  // tripEventsWorker.js, so the old bus-wide BUS_REACHED is no longer sent.
+  if (status === 'IN_PROGRESS' && (await currentWindowForBus(busId))) {
+    const queue = await getQueue();
+    await queue.send(JOBS.DISPATCH_NOTIFICATION, {
+      type: 'BUS_STARTED',
+      busId,
+      triggeredBy,
+    });
+  }
 }
 
 async function distanceToBase(busId, lat, lng) {
@@ -63,6 +80,17 @@ async function distanceToBase(busId, lat, lng) {
  */
 export async function evaluateTripState({ busId, latitude, longitude, speedKmh }) {
   const trip = await getTripState(busId);
+
+  // A trip left running from an earlier day (nobody tapped End, bus never came
+  // back to school) would keep showing "Running". Close it quietly.
+  if (trip.status === 'IN_PROGRESS' && trip.started_at) {
+    const day = (d) => d.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    if (day(new Date(trip.started_at)) !== day(new Date())) {
+      await setTripState(busId, 'COMPLETED', 'auto-expire');
+      return;
+    }
+  }
+
   const distance = await distanceToBase(busId, latitude, longitude);
   if (distance === null) return; // school has no coordinates set yet — can't evaluate
 

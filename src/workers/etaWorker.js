@@ -1,6 +1,7 @@
 import { supabase } from '../db/supabaseClient.js';
 import { getQueue, JOBS } from '../queue/queue.js';
 import { getDistanceToNextStopInMeters } from '../utils/geoUtils.js';
+import { currentWindowForBus } from '../utils/schoolHours.js';
 import {
   DEFAULTS,
   normaliseStops,
@@ -321,7 +322,10 @@ export async function checkArrivalEtas({ busId, latitude, longitude }) {
 
   if (REQUIRE_TRIP_IN_PROGRESS && !(await isTripRunning(busId))) return;
 
-  const type = routeTypeFor(now);
+  // Only inside the school's morning / evening windows; the window also says
+  // whether this is the pickup or the drop run.
+  const type = await currentWindowForBus(busId, now);
+  if (!type) return;
   const roster = await getRoster(busId, type);
   if (!roster || roster.students.size === 0) return;
 

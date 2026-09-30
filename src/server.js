@@ -3,6 +3,7 @@ import express from 'express';
 import { startGt06Server } from './gt06/tcpServer.js';
 import { evaluateTripState } from './workers/tripStateWorker.js';
 import { checkArrivalEtas } from './workers/etaWorker.js';
+import { checkTripEvents } from './workers/tripEventsWorker.js';
 import { startNotificationWorker } from './workers/notificationWorker.js';
 import tripsRouter from './api/routes/trips.js';
 import routesRouter from './api/routes/routes.js';
@@ -27,6 +28,11 @@ async function main() {
         await evaluateTripState({ busId, latitude, longitude, speedKmh });
       } catch (err) {
         console.error('[TripState] evaluation failed:', err.message);
+      }
+      try {
+        await checkTripEvents({ busId, latitude, longitude });
+      } catch (err) {
+        console.error('[TripEvents] check failed:', err.message);
       }
       try {
         await checkArrivalEtas({ busId, latitude, longitude });
