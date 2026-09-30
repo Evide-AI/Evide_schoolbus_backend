@@ -5,6 +5,7 @@ import { evaluateTripState } from './workers/tripStateWorker.js';
 import { checkArrivalEtas } from './workers/etaWorker.js';
 import { checkTripEvents } from './workers/tripEventsWorker.js';
 import { startNotificationWorker } from './workers/notificationWorker.js';
+import { startTripSweeper } from './workers/tripSweeper.js';
 import tripsRouter from './api/routes/trips.js';
 import routesRouter from './api/routes/routes.js';
 
@@ -17,6 +18,9 @@ async function main() {
   } catch (err) {
     console.error('[FCM] Could not start notification worker:', err.message);
   }
+
+  // Ends trips whose bus has gone silent, so nothing stays "Running" forever.
+  startTripSweeper();
 
   // --- GT06 GPS ingestion ---
   // Every time a position update comes in, feed it to the trip-state

@@ -1,7 +1,7 @@
 import { supabase } from '../db/supabaseClient.js';
 import { getQueue, JOBS } from '../queue/queue.js';
 import { getDistanceToNextStopInMeters } from '../utils/geoUtils.js';
-import { currentWindowForBus } from '../utils/schoolHours.js';
+import { currentWindowForBus, getSchoolSettings, serviceDate } from '../utils/schoolHours.js';
 
 // Tunable thresholds — expect to adjust these after your first real field
 // test, per the roadmap's open items. These are reasonable starting points,
@@ -28,6 +28,54 @@ async function getTripState(busId) {
   return data || { bus_id: busId, status: 'NOT_STARTED' };
 }
 
+/**
+ * Keeps trip_history in step with trip_state: one open row while a trip runs,
+ * closed when it ends. Never throws — history is a convenience and must not
+ * break starting or ending a trip.
+ */
+async function recordTripHistory(busId, status, triggeredBy) {
+  try {
+    const now = new Date();
+    const { data: open } = await supabase
+      .from('trip_history')
+      .select('id, started_at')
+      .eq('bus_id', busId)
+      .is('ended_at', null);
+
+    if (status === 'IN_PROGRESS') {
+      const today = serviceDate(now);
+      const current = (open || []).find((r) => serviceDate(new Date(r.started_at)) === today);
+      // Already have an open trip today (e.g. Start tapped twice): keep it.
+      const stale = (open || []).filter((r) => r !== current);
+      if (stale.length) {
+        await supabase.from('trip_history')
+          .update({ ended_at: now.toISOString(), ended_by: 'superseded' })
+          .in('id', stale.map((r) => r.id));
+      }
+      if (current) return;
+
+      const settings = await getSchoolSettings(busId);
+      if (!settings.school_id) return;
+      const { error } = await supabase.from('trip_history').insert({
+        bus_id: busId,
+        school_id: settings.school_id,
+        service_date: today,
+        route_type: (await currentWindowForBus(busId, now)) || 'other',
+        started_at: now.toISOString(),
+        started_by: triggeredBy,
+      });
+      if (error) console.error('[trip] history insert failed:', error.message);
+    } else if (open?.length) {
+      const { error } = await supabase.from('trip_history')
+        .update({ ended_at: now.toISOString(), ended_by: triggeredBy })
+        .in('id', open.map((r) => r.id));
+      if (error) console.error('[trip] history close failed:', error.message);
+    }
+  } catch (err) {
+    console.error('[trip] history error:', err.message);
+  }
+}
+
 async function setTripState(busId, status, triggeredBy) {
   const now = new Date().toISOString();
   const update = { bus_id: busId, status, triggered_by: triggeredBy, updated_at: now };
@@ -35,6 +83,7 @@ async function setTripState(busId, status, triggeredBy) {
   if (status === 'COMPLETED') update.ended_at = now;
 
   await supabase.from('trip_state').upsert(update, { onConflict: 'bus_id' });
+  await recordTripHistory(busId, status, triggeredBy);
 
   // Mirror the trip into buses.status so the parent app (which can read
   // buses but not trip_state) can show Running / Not running.
