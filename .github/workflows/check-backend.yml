@@ -1,0 +1,29 @@
+name: Check backend
+
+# Runs on every push to the production branch, and on pull requests into
+# production or main. The server installs production by itself (see
+# DEPLOY-AUTOMATION.md); this check shows a green tick or a red cross on GitHub
+# so a broken file is noticed straight away.
+on:
+  push:
+    branches: [production]
+  pull_request:
+    branches: [production, main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Install packages
+        run: npm ci
+      - name: Syntax check every source file
+        run: find src scripts -name '*.js' -not -path '*/node_modules/*' -print0 | xargs -0 -n1 node --check
+      - name: Check the deploy scripts
+        run: |
+          bash -n scripts/deploy.sh
+          bash -n scripts/install-auto-deploy.sh
