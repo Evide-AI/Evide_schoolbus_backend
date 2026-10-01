@@ -8,6 +8,7 @@ import { startNotificationWorker } from './workers/notificationWorker.js';
 import { startTripSweeper } from './workers/tripSweeper.js';
 import tripsRouter from './api/routes/trips.js';
 import routesRouter from './api/routes/routes.js';
+import adminRouter from './api/routes/admin.js';
 
 async function main() {
   // Start the FCM notification dispatch worker (consumes the notification queue).
@@ -71,6 +72,7 @@ async function main() {
   app.get('/health', (req, res) => res.json({ ok: true, uptime: process.uptime() }));
   app.use('/api/trips', tripsRouter);
   app.use('/api/routes', routesRouter);
+  app.use('/api/admin', adminRouter);
 
   const apiPort = process.env.API_PORT || 3000;
   app.listen(apiPort, () => {

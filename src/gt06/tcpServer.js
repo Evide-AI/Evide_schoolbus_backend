@@ -2,13 +2,18 @@ import net from 'node:net';
 import Gt06 from './gt06.js';
 import { isRoadrpaSentence, parseRoadrpa } from './roadrpa.js';
 import { supabase } from '../db/supabaseClient.js';
+import { touchDevice } from '../utils/deviceRegistry.js';
 
 // In-memory cache of imei -> bus_id so we're not hitting the DB on every ping.
 // Rebuilt lazily on cache miss (e.g. after adding a new bus).
+// Entries expire, so reassigning a device to another bus in the admin panel
+// takes effect within a few minutes without restarting the server.
+const CACHE_TTL_MS = 5 * 60 * 1000;
 const imeiToBusId = new Map();
 
 async function lookupBusId(imei) {
-  if (imeiToBusId.has(imei)) return imeiToBusId.get(imei);
+  const hit = imeiToBusId.get(imei);
+  if (hit && Date.now() - hit.at < CACHE_TTL_MS) return hit.id;
 
   const { data, error } = await supabase
     .from('buses')
@@ -22,11 +27,12 @@ async function lookupBusId(imei) {
     return null;
   }
   if (!data) {
+    imeiToBusId.delete(imei);
     console.warn(`[GT06] No active bus registered for IMEI ${imei} — ignoring until it's added in the dashboard`);
     return null;
   }
 
-  imeiToBusId.set(imei, data.id);
+  imeiToBusId.set(imei, { id: data.id, at: Date.now() });
   return data.id;
 }
 
@@ -116,6 +122,8 @@ export function startGt06Server(port, { onPositionUpdate } = {}) {
           socket.write(msg.responseMsg);
           console.log(`[GT06] Sent ACK to ${remote}: ${msg.responseMsg.toString('hex')}`);
         }
+
+        if (msg.imei) touchDevice(msg.imei, socket.remoteAddress);
 
         if (msg.event.number === 0x01 && msg.imei) {
           console.log(`[GT06] Login from IMEI ${msg.imei} (${remote})`);
