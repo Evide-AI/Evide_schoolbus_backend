@@ -64,6 +64,22 @@ main() {
     return 0
   fi
 
+  # Never overwrite edits that exist only on this server (for example a quick
+  # fix made over SSH). They would be lost for good, so stop and say so.
+  if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+    if [ -z "${DEPLOY_DISCARD_LOCAL:-}" ]; then
+      echo "!! This server has changes that are not in GitHub, so I will not overwrite them:"
+      git status --short --untracked-files=no
+      echo "   Either put those changes in the repository (commit them on your PC and push),"
+      echo "   or throw them away:  git checkout -- .   (a saved copy is made first if you run"
+      echo "   this script once with DEPLOY_DISCARD_LOCAL=1)."
+      return 1
+    fi
+    local backup="/var/tmp/evide-server-edits-$(date +%s).patch"
+    git diff > "$backup"
+    echo "Saved the server's local edits to $backup, then discarding them."
+  fi
+
   if [ "$(cat "$FAILED_FILE" 2>/dev/null || true)" = "$next" ] && [ -z "${FORCE:-}" ]; then
     echo "Version ${next:0:7} failed before; waiting for a newer commit on $branch."
     return 0

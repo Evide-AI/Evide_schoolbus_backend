@@ -39,42 +39,67 @@ async function getMessaging() {
   }
 }
 
-// Resolve which parents should receive a notification, and their device tokens.
+// Resolve who should receive a job, and their device tokens.
+// job.audience: 'parents' | 'staff' | 'both' (defaults to parents).
+// Staff = the drivers and conductors of the bus (or of the whole school).
 async function tokensForNotification(job) {
-  let parentUserIds = [];
+  const audience = job.audience || 'parents';
+  const wantsParents = audience !== 'staff';
+  const wantsStaff = audience !== 'parents';
+  const tokens = [];
 
-  if (job.parentUserIds?.length) {
-    // Already resolved by the sender (ETA alerts group siblings per parent).
-    parentUserIds = job.parentUserIds;
-  } else if (job.studentId) {
-    // Proximity alarm / student-specific: only that student's parents.
-    const { data: links } = await supabase
-      .from('parent_student_links')
-      .select('parent_user_id')
-      .eq('student_id', job.studentId);
-    parentUserIds = (links || []).map((l) => l.parent_user_id);
-  } else if (job.busId) {
-    // Bus-wide notification: all parents of students on this bus.
-    const { data: students } = await supabase
-      .from('students')
-      .select('id')
-      .eq('bus_id', job.busId);
-    const studentIds = (students || []).map((s) => s.id);
-    if (studentIds.length > 0) {
+  if (wantsParents) {
+    let parentUserIds = [];
+
+    if (job.parentUserIds?.length) {
+      // Already resolved by the sender (ETA alerts group siblings per parent).
+      parentUserIds = job.parentUserIds;
+    } else if (job.studentId) {
+      // Proximity alarm / student-specific: only that student's parents.
       const { data: links } = await supabase
         .from('parent_student_links')
         .select('parent_user_id')
-        .in('student_id', studentIds);
-      parentUserIds = [...new Set((links || []).map((l) => l.parent_user_id))];
+        .eq('student_id', job.studentId);
+      parentUserIds = (links || []).map((l) => l.parent_user_id);
+    } else if (job.busId || job.schoolId) {
+      // Bus-wide (or, with no bus, school-wide): every parent of the matching students.
+      let q = supabase.from('students').select('id');
+      q = job.busId ? q.eq('bus_id', job.busId) : q.eq('school_id', job.schoolId);
+      const { data: students } = await q;
+      const studentIds = (students || []).map((s) => s.id);
+      if (studentIds.length > 0) {
+        const { data: links } = await supabase
+          .from('parent_student_links')
+          .select('parent_user_id')
+          .in('student_id', studentIds);
+        parentUserIds = [...new Set((links || []).map((l) => l.parent_user_id))];
+      }
+    }
+
+    if (parentUserIds.length > 0) {
+      const { data } = await supabase
+        .from('device_tokens')
+        .select('fcm_token')
+        .in('parent_user_id', parentUserIds);
+      tokens.push(...(data || []).map((t) => t.fcm_token));
     }
   }
 
-  if (parentUserIds.length === 0) return [];
-  const { data: tokens } = await supabase
-    .from('device_tokens')
-    .select('fcm_token')
-    .in('parent_user_id', parentUserIds);
-  return [...new Set((tokens || []).map((t) => t.fcm_token))];
+  if (wantsStaff && (job.busId || job.schoolId)) {
+    let q = supabase.from('drivers').select('id').eq('is_active', true);
+    q = job.busId ? q.eq('bus_id', job.busId) : q.eq('school_id', job.schoolId);
+    const { data: staff } = await q;
+    const staffIds = (staff || []).map((d) => d.id);
+    if (staffIds.length > 0) {
+      const { data } = await supabase
+        .from('device_tokens')
+        .select('fcm_token')
+        .in('driver_id', staffIds);
+      tokens.push(...(data || []).map((t) => t.fcm_token));
+    }
+  }
+
+  return [...new Set(tokens.filter(Boolean))];
 }
 
 // Student-specific notifications (attendance, absent) must never fall through
@@ -139,21 +164,44 @@ async function handleDispatch(job) {
   try {
     const res = await fcm.sendEachForMulticast(message);
     console.log(`[FCM] Sent ${job.type}: ${res.successCount} ok, ${res.failureCount} failed`);
-    // Clean up tokens FCM reports as permanently invalid.
+    // Clean up tokens FCM reports as permanently invalid; record any other
+    // failure so the super admin panel can show it.
     if (res.failureCount > 0) {
       const stale = [];
+      const failures = {};
       res.responses.forEach((r, i) => {
-        if (!r.success && r.error?.code === 'messaging/registration-token-not-registered') {
+        if (r.success) return;
+        const code = r.error?.code || 'unknown';
+        if (code === 'messaging/registration-token-not-registered') {
           stale.push(tokens[i]);
+        } else {
+          failures[code] ||= { count: 0, message: r.error?.message };
+          failures[code].count += 1;
         }
       });
       if (stale.length > 0) {
         await supabase.from('device_tokens').delete().in('fcm_token', stale);
         console.log(`[FCM] Removed ${stale.length} stale token(s)`);
       }
+      for (const [code, f] of Object.entries(failures)) {
+        await supabase.from('push_failures').insert({
+          category: job.type || null,
+          bus_id: job.busId || null,
+          error_code: code,
+          error_message: (f.message || '').slice(0, 300),
+          failed_count: f.count,
+        });
+      }
     }
   } catch (err) {
     console.error('[FCM] send failed:', err.message);
+    await supabase.from('push_failures').insert({
+      category: job.type || null,
+      bus_id: job.busId || null,
+      error_code: 'send_failed',
+      error_message: String(err.message || '').slice(0, 300),
+      failed_count: 1,
+    });
   }
 }
 

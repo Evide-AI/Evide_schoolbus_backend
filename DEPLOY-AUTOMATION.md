@@ -133,6 +133,17 @@ journalctl -u evide-auto-deploy -n 50 --no-pager
 
 You will see `Deployed abc1234. Backend is healthy.`, or a rollback message.
 
+## If the server has edits that are not in GitHub
+
+Do not edit code directly on the server. If you do, the deploy script stops
+(it will not overwrite them) and prints the changed files in
+`journalctl -u evide-auto-deploy`. Fix it one of two ways:
+
+- Keep the change: make the same edit on your PC, commit, push to `production`,
+  then on the server run `git checkout -- .` so the server copy matches GitHub.
+- Drop the change: run `DEPLOY_DISCARD_LOCAL=1 bash scripts/deploy.sh`. It saves
+  the edits to `/var/tmp/evide-server-edits-<time>.patch` first, then continues.
+
 ## Good to know
 
 - **Database changes are not automatic.** If a release needs a Supabase
