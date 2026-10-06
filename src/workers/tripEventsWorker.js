@@ -55,17 +55,19 @@ function metersToSegment(p, a, b) {
 
 // ---------- loaders ----------
 
-async function isTripRunning(busId) {
+async function getTrip(busId) {
   const hit = tripCache.get(busId);
-  if (hit && Date.now() - hit.at < TRIP_TTL_MS) return hit.running;
+  if (hit && Date.now() - hit.at < TRIP_TTL_MS) return hit;
   const { data } = await supabase.from('trip_state').select('status, started_at').eq('bus_id', busId).maybeSingle();
   const running = data?.status === 'IN_PROGRESS'
     && (!data.started_at || serviceDate(new Date(data.started_at)) === serviceDate());
-  tripCache.set(busId, { at: Date.now(), running });
-  return running;
+  const startedMs = data?.started_at ? new Date(data.started_at).getTime() : 0;
+  const entry = { at: Date.now(), running, startedMs };
+  tripCache.set(busId, entry);
+  return entry;
 }
 
-async function buildContext(busId, type, today, settings, previous) {
+async function buildContext(busId, type, today, settings, previous, tripStartedMs) {
   const [latF, lngF] = type === 'pickup' ? ['pickup_lat', 'pickup_lng'] : ['drop_lat', 'drop_lng'];
   const [{ data: students, error }, { data: bus }] = await Promise.all([
     supabase.from('students').select(`id, full_name, ${latF}, ${lngF}`).eq('bus_id', busId),
@@ -76,18 +78,25 @@ async function buildContext(busId, type, today, settings, previous) {
     return previous || null;
   }
 
+  // A new trip (different started_at) starts every student from 'waiting'
+  // again, so a re-run on the same day never inherits the last run's stages.
   const ctx = previous && previous.day === today && previous.type === type
+      && previous.tripStartedMs === tripStartedMs
     ? previous
-    : { day: today, type, students: new Map(), attendance: { at: 0, map: new Map() }, loaded: false };
+    : { day: today, type, tripStartedMs, students: new Map(), attendance: { at: 0, map: new Map() }, loaded: false };
 
   // Resume from the database after a restart.
   let saved = new Map();
   if (!ctx.loaded) {
     const { data: rows } = await supabase
       .from('student_trip_status')
-      .select('student_id, stage, reached_at')
+      .select('student_id, stage, reached_at, updated_at')
       .eq('bus_id', busId).eq('service_date', today).eq('route_type', type);
-    saved = new Map((rows || []).map((r) => [r.student_id, r]));
+    // Only resume rows written during the current trip. Older rows belong to
+    // an earlier run today and are overwritten with 'waiting' below.
+    saved = new Map((rows || [])
+      .filter((r) => !tripStartedMs || new Date(r.updated_at).getTime() >= tripStartedMs)
+      .map((r) => [r.student_id, r]));
   }
 
   const fresh = [];
@@ -204,14 +213,16 @@ export async function checkTripEvents({ busId, latitude, longitude }) {
   const bus = { lat: latitude, lng: longitude };
   lastPoint.set(busId, bus);
 
-  if (!(await isTripRunning(busId))) return;
+  const trip = await getTrip(busId);
+  if (!trip.running) return;
   const settings = await getSchoolSettings(busId);
   const type = activeWindow(settings, now);
   if (!type) return; // outside school hours: no events, no notifications
 
   let ctx = ctxByBus.get(busId);
-  if (!ctx || ctx.day !== today || ctx.type !== type || Date.now() - ctx.loadedAt > ROSTER_TTL_MS) {
-    ctx = await buildContext(busId, type, today, settings, ctx);
+  if (!ctx || ctx.day !== today || ctx.type !== type || ctx.tripStartedMs !== trip.startedMs
+      || Date.now() - ctx.loadedAt > ROSTER_TTL_MS) {
+    ctx = await buildContext(busId, type, today, settings, ctx, trip.startedMs);
     if (!ctx) return;
     ctxByBus.set(busId, ctx);
   }
@@ -245,7 +256,10 @@ export async function checkTripEvents({ busId, latitude, longitude }) {
             await notifyOnce(busId, ctx, s, 'REACHED_STOP',
               `Bus reached ${firstName(s)}'s stop`,
               `${busNo} has reached ${firstName(s)}'s pickup point.`);
-          } else if (att?.present === true) {
+          } else if (!hasStop && att?.present === true) {
+            // No stop coordinates to measure against: trust the attendance mark.
+            // With a stop, "present" is only used once the bus has reached it,
+            // so the yellow line keeps leading to the stop until then.
             s.stage = 'picked_up';
             s.inferred = false;
           }
