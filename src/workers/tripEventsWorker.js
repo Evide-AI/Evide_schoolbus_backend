@@ -11,8 +11,16 @@ import { getSchoolSettings, activeWindow, serviceDate } from '../utils/schoolHou
  *
  * Notifications (each sent once per student per trip, parents of that child only):
  *   REACHED_STOP    bus within 100 m of the stop (pickup or drop point)
+ *   PICKED_UP       bus drove off from the stop and nobody marked the child absent
+ *                   (exceptions-only attendance: present unless marked absent)
  *   STUDENT_ABSENT  driver/conductor marked the child absent after the bus reached the stop
  *   REACHED_SCHOOL  bus within 100 m of the school with the child on board (morning)
+ *   LEFT_SCHOOL     bus drove out of the school with the child on board (evening)
+ *   DROPPED_HOME    bus drove off from the child's drop point (evening)
+ *
+ * Together with the "bus checked empty" sweep (emptyCheckWorker.js) this is
+ * the full chain of custody: boarded -> reached school -> left school ->
+ * dropped home -> bus confirmed empty.
  * ("Bus arriving in ~10 min" lives in etaWorker.js; attendance-marked entries
  *  come from the attendance trigger.)
  *
@@ -58,11 +66,11 @@ function metersToSegment(p, a, b) {
 async function getTrip(busId) {
   const hit = tripCache.get(busId);
   if (hit && Date.now() - hit.at < TRIP_TTL_MS) return hit;
-  const { data } = await supabase.from('trip_state').select('status, started_at').eq('bus_id', busId).maybeSingle();
+  const { data } = await supabase.from('trip_state').select('status, started_at, triggered_by').eq('bus_id', busId).maybeSingle();
   const running = data?.status === 'IN_PROGRESS'
     && (!data.started_at || serviceDate(new Date(data.started_at)) === serviceDate());
   const startedMs = data?.started_at ? new Date(data.started_at).getTime() : 0;
-  const entry = { at: Date.now(), running, startedMs };
+  const entry = { at: Date.now(), running, startedMs, triggeredBy: data?.triggered_by || null };
   tripCache.set(busId, entry);
   return entry;
 }
@@ -83,7 +91,11 @@ async function buildContext(busId, type, today, settings, previous, tripStartedM
   const ctx = previous && previous.day === today && previous.type === type
       && previous.tripStartedMs === tripStartedMs
     ? previous
-    : { day: today, type, tripStartedMs, students: new Map(), attendance: { at: 0, map: new Map() }, loaded: false };
+    : {
+      day: today, type, tripStartedMs, students: new Map(), attendance: { at: 0, map: new Map() }, loaded: false,
+      seenAtSchool: false, // evening: bus has been at school during this trip
+      leftSchool: false,   // evening: LEFT_SCHOOL already handled for this trip
+    };
 
   // Resume from the database after a restart.
   let saved = new Map();
@@ -232,8 +244,20 @@ export async function checkTripEvents({ busId, latitude, longitude }) {
   const changed = [];
   const busNo = ctx.busNumber;
 
-  const atSchool = settings.latitude != null && settings.longitude != null
-    && metersBetween(latitude, longitude, settings.latitude, settings.longitude) <= SCHOOL_RADIUS_M;
+  const schoolDist = settings.latitude != null && settings.longitude != null
+    ? metersBetween(latitude, longitude, settings.latitude, settings.longitude)
+    : null;
+  const atSchool = schoolDist != null && schoolDist <= SCHOOL_RADIUS_M;
+
+  // Evening: the bus has left school once it has been at school during this
+  // trip (or the trip auto-started, which only happens on leaving school)
+  // and is now past the larger "left" radius, so GPS jitter at the gate
+  // doesn't count as leaving.
+  if (type === 'drop' && schoolDist != null) {
+    if (atSchool || trip.triggeredBy === 'auto') ctx.seenAtSchool = true;
+  }
+  const justLeftSchool = type === 'drop' && !ctx.leftSchool && ctx.seenAtSchool
+    && schoolDist != null && schoolDist > LEAVE_RADIUS_M;
 
   for (const s of ctx.students.values()) {
     const before = s.stage;
@@ -277,6 +301,9 @@ export async function checkTripEvents({ busId, latitude, longitude }) {
             // Bus has driven off and nobody marked the child absent: on board.
             s.stage = 'picked_up';
             s.inferred = true;
+            await notifyOnce(busId, ctx, s, 'PICKED_UP',
+              `${firstName(s)} is on the bus`,
+              `${busNo} picked up ${firstName(s)} and is on the way to school.`);
           }
         } else if (s.stage === 'absent') {
           if (att?.present === true) { s.stage = 'picked_up'; s.inferred = false; } // marked present after all
@@ -302,12 +329,27 @@ export async function checkTripEvents({ busId, latitude, longitude }) {
             `${busNo} has reached ${firstName(s)}'s drop point.`);
         } else if (s.stage === 'reached' && d > LEAVE_RADIUS_M) {
           s.stage = 'dropped';
+          await notifyOnce(busId, ctx, s, 'DROPPED_HOME',
+            `${firstName(s)} was dropped off`,
+            `${busNo} dropped ${firstName(s)} at the drop point and has moved on.`);
         }
       }
       if (s.stage === startStage) break;
     }
 
     if (s.stage !== before) changed.push(s);
+  }
+
+  // After the loop, so a child marked absent on this same ping is already
+  // 'absent' and gets no "left school" message.
+  if (justLeftSchool) {
+    ctx.leftSchool = true;
+    for (const s of ctx.students.values()) {
+      if (s.stage !== 'waiting') continue; // absent, or already reached/dropped
+      await notifyOnce(busId, ctx, s, 'LEFT_SCHOOL',
+        `${firstName(s)} is on the way home`,
+        `${busNo} has left school with ${firstName(s)} on board.`);
+    }
   }
 
   await persist(busId, ctx, changed);
