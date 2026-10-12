@@ -110,6 +110,22 @@ function isStudentSpecific(job) {
   return kind.includes('ATTENDANCE') || kind.includes('ABSENT');
 }
 
+// Trip moments that ring the alarm tone on the parent's phone (alarm
+// channel, loud, works when the app is closed). Everything else uses the
+// normal notification sound. Override with ALARM_KINDS in .env.
+const ALARM_KINDS = new Set(
+  (process.env.ALARM_KINDS
+    || 'PROXIMITY_ALARM,ARRIVING_SOON,REACHED_STOP,REACHED_SCHOOL,LEFT_SCHOOL,DROPPED_HOME')
+    .split(',').map((s) => s.trim().toUpperCase()).filter(Boolean)
+);
+
+function isAlarmJob(job) {
+  if ((job.audience || 'parents') === 'staff') return false; // driver app has no alarm channel
+  const type = String(job.type || '').toUpperCase();
+  const category = String(job.category || '').toUpperCase();
+  return ALARM_KINDS.has(type) || ALARM_KINDS.has(category);
+}
+
 async function handleDispatch(job) {
   if (isStudentSpecific(job) && !job.studentId && !job.parentUserIds?.length) {
     console.warn(`[FCM] Dropped ${job.type || job.category}: student-specific push with no studentId (would have gone to the whole bus).`);
@@ -124,10 +140,12 @@ async function handleDispatch(job) {
   const fcm = await getMessaging();
   if (!fcm) return; // Firebase not configured yet.
 
-  // For a proximity alarm we set an Android channel + high priority so the
-  // phone rings even in the background; the Flutter app plays the alarm sound
-  // on this channel.
-  const isAlarm = job.type === 'PROXIMITY_ALARM';
+  // Alarm pushes go on the alarm channel with high priority so the phone
+  // rings even in the background. The parent app also rings in the
+  // foreground for data.type 'PROXIMITY_ALARM', so every alarm kind is sent
+  // with that type; the real kind travels in data.category.
+  const isAlarm = isAlarmJob(job);
+  const kind = String(job.category || job.type || 'GENERAL');
   const message = {
     tokens,
     notification: {
@@ -135,7 +153,8 @@ async function handleDispatch(job) {
       body: job.body || '',
     },
     data: {
-      type: job.type || 'GENERAL',
+      type: isAlarm ? 'PROXIMITY_ALARM' : (job.type || 'GENERAL'),
+      category: kind,
       // Copies of the title/body so a data-only push can still be shown.
       title: job.title || 'Evide School Bus',
       body: job.body || '',
@@ -163,7 +182,7 @@ async function handleDispatch(job) {
 
   try {
     const res = await fcm.sendEachForMulticast(message);
-    console.log(`[FCM] Sent ${job.type}: ${res.successCount} ok, ${res.failureCount} failed`);
+    console.log(`[FCM] Sent ${kind}${isAlarm ? ' (alarm)' : ''}: ${res.successCount} ok, ${res.failureCount} failed`);
     // Clean up tokens FCM reports as permanently invalid; record any other
     // failure so the super admin panel can show it.
     if (res.failureCount > 0) {
