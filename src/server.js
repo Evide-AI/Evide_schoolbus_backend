@@ -6,6 +6,7 @@ import { checkArrivalEtas } from './workers/etaWorker.js';
 import { checkTripEvents } from './workers/tripEventsWorker.js';
 import { startNotificationWorker } from './workers/notificationWorker.js';
 import { startTripSweeper } from './workers/tripSweeper.js';
+import { startEmptyCheckSweeper } from './workers/emptyCheckWorker.js';
 import tripsRouter from './api/routes/trips.js';
 import routesRouter from './api/routes/routes.js';
 import adminRouter from './api/routes/admin.js';
@@ -22,6 +23,9 @@ async function main() {
 
   // Ends trips whose bus has gone silent, so nothing stays "Running" forever.
   startTripSweeper();
+
+  // Alerts staff if a bus isn't confirmed empty soon after a school trip ends.
+  startEmptyCheckSweeper();
 
   // --- GT06 GPS ingestion ---
   // Every time a position update comes in, feed it to the trip-state

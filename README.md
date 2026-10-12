@@ -206,3 +206,37 @@ child's stop, with the expected clock time. Logic: `src/workers/etaWorker.js`
 - Needs `migration_006_eta_notifications.sql`, and routes regenerated once
   (`POST /api/routes/:busId/generate`) to get grouped stops + Mapbox leg times.
   Without a generated route it falls back to distance-based ETAs.
+
+## Chain of custody (bus students)
+
+Parents follow their child from home to school and back, with no extra
+hardware: the bus GPS and the school geofence do the work. Each message
+goes once per child per trip, to that child's parents only.
+
+| Message | When |
+|---|---|
+| `REACHED_STOP` | bus within 100 m of the stop |
+| `PICKED_UP` | bus drove off from the stop and nobody marked the child absent |
+| `STUDENT_ABSENT` | marked absent after the bus reached the stop |
+| `REACHED_SCHOOL` | bus inside the school geofence with the child on board (morning) |
+| `LEFT_SCHOOL` | bus left the school geofence with the child on board (evening) |
+| `DROPPED_HOME` | bus drove off from the child's drop point (evening) |
+
+Attendance is **exceptions-only**: a child counts as on board unless the
+conductor marks them absent. The driver app only needs an "absent" toggle.
+
+### Bus checked empty
+
+After every school trip the driver or conductor taps **Bus checked empty**:
+
+```
+POST /api/trips/:busId/empty-check     (Authorization: Bearer <driver session>)
+GET  /api/trips/:busId/empty-check     -> { trip, needsCheck }
+```
+
+If nobody taps it within `EMPTY_CHECK_MINUTES` (default 10) of the trip
+ending, the backend adds a row to `bus_safety_alerts` (school dashboard,
+live) and pushes the bus's driver and conductor. Parents are never told.
+A late tap marks the alert resolved.
+
+Needs `migration_012_chain_of_custody.sql`.
