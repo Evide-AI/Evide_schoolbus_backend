@@ -1,0 +1,41 @@
+diff --git a/src/workers/notificationWorker.js b/src/workers/notificationWorker.js
+index a8a406e..052b6ca 100644
+--- a/src/workers/notificationWorker.js
++++ b/src/workers/notificationWorker.js
+@@ -128,6 +128,10 @@ async function handleDispatch(job) {
+   // phone rings even in the background; the Flutter app plays the alarm sound
+   // on this channel.
+   const isAlarm = job.type === 'PROXIMITY_ALARM';
++  // How long FCM keeps trying if the phone is off or offline. A "bus is near"
++  // alarm is useless after a couple of minutes, but incidents (absent, trip
++  // ended, notices) should still arrive when the parent's phone comes back.
++  const ttlSec = isAlarm ? 120 : 24 * 3600;
+   const message = {
+     tokens,
+     notification: {
+@@ -145,6 +149,7 @@ async function handleDispatch(job) {
+     },
+     android: {
+       priority: 'high',
++      ttl: ttlSec * 1000,
+       notification: {
+         channelId: isAlarm ? 'proximity_alarm_v2' : 'general',
+         sound: isAlarm ? 'alarm' : 'default',
+@@ -155,8 +160,16 @@ async function handleDispatch(job) {
+       },
+     },
+     apns: {
++      headers: {
++        'apns-priority': '10',
++        'apns-expiration': String(Math.floor(Date.now() / 1000) + ttlSec),
++      },
+       payload: {
+-        aps: { sound: isAlarm ? 'alarm.caf' : 'default' },
++        aps: {
++          sound: isAlarm ? 'alarm.caf' : 'default',
++          // Breaks through Focus modes without needing Apple's Critical Alerts entitlement.
++          'interruption-level': 'time-sensitive',
++        },
+       },
+     },
+   };
